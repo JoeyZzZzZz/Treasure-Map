@@ -68,6 +68,11 @@ class AnalyzeResult:
     # cross-binary exec edge resolves its targets through). 0 is a real answer for a rootfs with
     # no links; it is never a "did not run" signal — the walk always runs.
     symlinks_recorded: int = 0
+    # ★ Red-line (a skip must be visible): binaries NOT re-run this scan because they timed out at
+    # a budget this scan would only repeat. Each is ``{binary, size_bytes, budget_seconds}``. They
+    # are still counted incomplete and still named by ``incomplete_binaries`` — this list says why
+    # no Ghidra time was spent on them, so "it went fast" is never mistaken for "it went clean".
+    timeout_skipped: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def run_analyze(
@@ -78,6 +83,7 @@ async def run_analyze(
     skip_non_binary: bool = False,
     skip_ingesters: frozenset[str] = frozenset(),
     reanalyze: str | None = None,
+    force_retry: bool = False,
 ) -> AnalyzeResult:
     """Orchestrate a full firmware analysis run.
 
@@ -85,6 +91,8 @@ async def run_analyze(
     After Ghidra, JSON output is ingested into functions/imports/exports/strings.
 
     ``reanalyze`` (REANALYZE_ALL or a binary name/path) forces re-analysis ignoring the cache.
+    ``force_retry`` re-attempts binaries that timed out at a budget this scan would repeat, which
+    are otherwise left alone (see ``db_ingest._timeout_skips``); it does not touch the cache.
 
     Fail-fast: discovers analyzeHeadless before scanning so a missing Ghidra
     installation is reported immediately rather than after a long ELF scan.
@@ -117,6 +125,7 @@ async def run_analyze(
     ghidra_ok = 0
     ghidra_failed = 0
     incomplete_binaries: list[str] = []
+    timeout_skipped: list[dict[str, Any]] = []
     ingest_stats = IngestStats()
     symlinks_recorded = 0
     xref_stats = XrefStats()
@@ -127,9 +136,32 @@ async def run_analyze(
         symlinks_recorded = write_symlinks(conn, symlink_collector.records)
 
         sha_to_id, dirty_shas = ingest_elfs(
-            conn, records, reanalyze=reanalyze, pass_version=pass_version
+            conn,
+            records,
+            reanalyze=reanalyze,
+            pass_version=pass_version,
+            timeout_base=config.ghidra.headless_timeout_seconds,
+            force_retry=force_retry,
         )
         dirty_records = [r for r in records if r.sha256 in dirty_shas]
+
+        # What the skip cost, read back from the DECISION rather than re-derived: a timed-out
+        # binary in this scan that is not in the dirty set is one nothing will be spent on. Deriving
+        # it from dirty_shas means the report cannot drift from the rule — change the rule and this
+        # follows, instead of quietly describing the old one.
+        scanned_shas = {r.sha256 for r in records}
+        timeout_skipped = [
+            {
+                "binary": row["name"],
+                "size_bytes": row["size_bytes"],
+                "budget_seconds": row["timeout_budget"],
+            }
+            for row in conn.execute(
+                "SELECT name, sha256, size_bytes, timeout_budget FROM binaries "
+                "WHERE ghidra_ok = 0 AND ghidra_status_reason = 'timeout' ORDER BY name"
+            ).fetchall()
+            if row["sha256"] in scanned_shas and row["sha256"] not in dirty_shas
+        ]
 
         logger.info(
             "pipeline: %d total, %d dirty, %d cached",
@@ -166,10 +198,22 @@ async def run_analyze(
                 else:
                     # record WHY it failed (timeout/import_failed/no_output/incomplete) so the
                     # incomplete surfacing can tell a recoverable timeout from a structural failure.
+                    # ...and record what this attempt RAN UNDER: the budget it was given and
+                    # the extraction fingerprint behind it. pass_version stays untouched above
+                    # because it describes a row's OUTPUT and there is none; these two describe the
+                    # ATTEMPT, which is what the next scan compares against to decide whether
+                    # re-running would be a different attempt or the same one twice.
                     conn.execute(
-                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, ghidra_status_reason=? "
-                        "WHERE sha256=?",
-                        (0, res.analysis_status, res.reason, rec.sha256),
+                        "UPDATE binaries SET ghidra_ok=?, ghidra_status=?, ghidra_status_reason=?, "
+                        "timeout_budget=?, timeout_pass_version=? WHERE sha256=?",
+                        (
+                            0,
+                            res.analysis_status,
+                            res.reason,
+                            res.timeout_budget,
+                            pass_version,
+                            rec.sha256,
+                        ),
                     )
                 if res.success:
                     ghidra_ok += 1
@@ -239,5 +283,6 @@ async def run_analyze(
         web_endpoints_ingested=nb_stats.sub_rows.get("web_asset", 0),
         elapsed=time.monotonic() - t0,
         incomplete_binaries=incomplete_binaries,
+        timeout_skipped=timeout_skipped,
         symlinks_recorded=symlinks_recorded,
     )

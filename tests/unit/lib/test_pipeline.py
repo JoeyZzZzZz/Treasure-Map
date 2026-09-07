@@ -207,3 +207,116 @@ async def test_progress_callback_passed_to_run_all(tmp_path: Path) -> None:
 
     _args, kwargs = runner.run_all.call_args
     assert kwargs.get("progress_callback") is cb or cb in _args
+
+
+# ── what a failed attempt ran under, and what the report says about a skip ────────────
+
+
+async def test_a_failed_attempt_records_its_budget_and_its_extractor(tmp_path: Path) -> None:
+    """The failure UPDATE stores the two facts the next scan's decision is made from.
+
+    ``pass_version`` is deliberately NOT stamped on failure — it describes the OUTPUT a row
+    produced, and a failure produced none. That is exactly why the attempt's own fingerprint needs
+    its own column: without it the next scan cannot tell an edited extractor from an unedited one
+    and could never skip anything at all.
+
+    MUTATION (must go RED): drop either column from the failure UPDATE, or stamp pass_version on
+    failure and read that instead (the output column then lies about a row with no output)."""
+    from treasure_map.lib.storage.connection import open_db
+
+    rec = _rec()
+    failed = GhidraResult(
+        binary=rec.path,
+        output_file=None,
+        success=False,
+        elapsed=1.0,
+        reason="timeout",
+        timeout_budget=846,
+    )
+    runner = _mock_runner([failed])
+
+    with patch(f"{MODULE}.GhidraRunner", return_value=runner):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({rec.sha256})):
+                with Workspace(tmp_path / "ws") as ws:
+                    # ingest_elfs is mocked here, so the row it would have inserted is seeded.
+                    seed = open_db(ws.db_path)
+                    seed.execute(
+                        "INSERT INTO binaries (name, path, sha256, last_seen_at) "
+                        "VALUES (?, ?, ?, '2026-01-01')",
+                        (rec.name, str(rec.path), rec.sha256),
+                    )
+                    seed.commit()
+                    seed.close()
+                    result = await run_analyze(tmp_path / "fs", ws, _cfg())
+
+    conn = open_db(result.db_path)
+    row = conn.execute(
+        "SELECT ghidra_status_reason, timeout_budget, timeout_pass_version, pass_version "
+        "FROM binaries WHERE sha256 = ?",
+        (rec.sha256,),
+    ).fetchone()
+    conn.close()
+    assert row["ghidra_status_reason"] == "timeout"
+    assert row["timeout_budget"] == 846
+    assert row["timeout_pass_version"] == "testpass"
+    assert row["pass_version"] is None  # the output column stays empty — there was no output
+
+
+async def test_the_report_names_what_was_skipped_and_follows_the_decision(
+    tmp_path: Path,
+) -> None:
+    """★ A skip must be visible: the scan gets faster and covers less, and only saying so tells
+    those two apart.
+
+    Derived from the dirty set rather than re-computed, so the report cannot describe a rule the
+    code no longer follows: a timed-out binary in this scan that nothing will be spent on IS the
+    skip, by definition.
+
+    MUTATION (must go RED): report every timeout row instead of only the ones left out of the dirty
+    set — a binary being re-attempted right now would be listed as skipped."""
+    from treasure_map.lib.storage.connection import open_db
+
+    skipped = _rec("big_daemon", "facefeed")
+    retried = _rec("httpd", "cafebabe")
+
+    # Both timed out before; this scan re-runs only httpd (as a bigger budget or a pass edit would).
+    def _seed(db_path: Path) -> None:
+        conn = open_db(db_path)
+        for rec in (skipped, retried):
+            conn.execute(
+                "INSERT INTO binaries (name, path, sha256, size_bytes, ghidra_ok, ghidra_status, "
+                "ghidra_status_reason, timeout_budget, timeout_pass_version, last_seen_at) "
+                "VALUES (?, ?, ?, ?, 0, 'failed', 'timeout', 846, 'testpass', '2026-01-01')",
+                (rec.name, str(rec.path), rec.sha256, 14789215),
+            )
+        conn.commit()
+        conn.close()
+
+    runner = _mock_runner([_fail_ghidra(retried)])
+    with patch(f"{MODULE}.GhidraRunner", return_value=runner):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[skipped, retried]):
+            with patch(f"{MODULE}.ingest_elfs", _mock_ingest({retried.sha256})):
+                with Workspace(tmp_path / "ws") as ws:
+                    _seed(ws.db_path)
+                    result = await run_analyze(tmp_path / "fs", ws, _cfg())
+
+    assert [e["binary"] for e in result.timeout_skipped] == ["big_daemon"]
+    assert result.timeout_skipped[0]["budget_seconds"] == 846
+    assert result.timeout_skipped[0]["size_bytes"] == 14789215
+
+
+async def test_force_retry_reaches_the_dirty_check(tmp_path: Path) -> None:
+    """The escape hatch is plumbed, not just accepted at the CLI and dropped on the way down."""
+    rec = _rec()
+    runner = _mock_runner([_ok_ghidra(rec)])
+    ingest = _mock_ingest({rec.sha256})
+
+    with patch(f"{MODULE}.GhidraRunner", return_value=runner):
+        with patch(f"{MODULE}.scan_filesystem", return_value=[rec]):
+            with patch(f"{MODULE}.ingest_elfs", ingest):
+                with Workspace(tmp_path / "ws") as ws:
+                    await run_analyze(tmp_path / "fs", ws, _cfg(), force_retry=True)
+
+    assert ingest.call_args.kwargs["force_retry"] is True
+    assert ingest.call_args.kwargs["timeout_base"] == _cfg().ghidra.headless_timeout_seconds

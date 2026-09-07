@@ -1343,6 +1343,14 @@ def atlas_view(view: str, config: Path | None, atlas_path: Path | None) -> None:
     default=None,
     help="Atlas DB path (defaults to the configured atlas.db_path).",
 )
+@click.option(
+    "--force-retry",
+    is_flag=True,
+    default=False,
+    help="Also re-attempt binaries that timed out at a budget this scan would repeat, which are "
+    "skipped by default (a timeout is deterministic — the same budget reproduces it). Use after "
+    "raising the timeout, or on a machine with more to spare.",
+)
 def scan(
     fs_root: Path,
     workspace: str | None,
@@ -1359,6 +1367,7 @@ def scan(
     rehunt: bool,
     config: Path | None,
     atlas_path: Path | None,
+    force_retry: bool,
 ) -> None:
     """Run the whole main path on one extracted firmware: analyze -> hunt -> triage.
 
@@ -1368,7 +1377,7 @@ def scan(
     """
     import asyncio
 
-    from treasure_map.cli.analyze_cli import _warn_incomplete
+    from treasure_map.cli.analyze_cli import _report_timeout_skips, _warn_incomplete
     from treasure_map.lib.atlas.connection import open_atlas
     from treasure_map.lib.config.config import load_config
     from treasure_map.lib.errors import GhidraNotFoundError, TreasureMapError
@@ -1422,6 +1431,7 @@ def scan(
                     skip_non_binary=skip_non_binary,
                     skip_ingesters=frozenset(skip_ingesters),
                     reanalyze=reanalyze,
+                    force_retry=force_retry,
                 )
             )
     except KeyboardInterrupt:
@@ -1435,6 +1445,7 @@ def scan(
         f"      → analysis.db: {result.binary_count} binaries, "
         f"{result.functions_ingested} functions"
     )
+    _report_timeout_skips(result.timeout_skipped)
     _warn_incomplete(result.incomplete_binaries)
 
     # [2/3] hunt call-sequence shapes -> atlas.

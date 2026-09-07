@@ -51,6 +51,13 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # on older DBs (a pre-feature failure carries no reason -> failed with an unknown cause).
     # Must match schema.sql.
     ("binaries", "ghidra_status_reason", "TEXT"),
+    # What the LAST failed Ghidra attempt ran under: its wall-clock budget and the extraction
+    # fingerprint. A timeout is deterministic, so re-running one at the same budget with the same
+    # code buys an identical failure; these two are what "the same" is measured against. Back-fill
+    # NULL on older DBs, which reads as "nothing recorded to compare" -> re-run, never skip. Must
+    # match schema.sql.
+    ("binaries", "timeout_budget", "INTEGER"),
+    ("binaries", "timeout_pass_version", "TEXT"),
     # honest string-truncation transport: true match count + a prefix flag, so get_strings surfaces
     # a capped/searched binary's dropped strings instead of reading them as "absent". Back-fill
     # NULL/0 on older DBs (a genuinely complete list is the pre-cap default). Must match schema.sql.

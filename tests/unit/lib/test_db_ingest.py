@@ -627,3 +627,306 @@ def test_cached_rescan_refreshes_binaries_path(tmp_path: Path) -> None:
     assert after["last_seen_at"] >= before["last_seen_at"]  # non-regression: last_seen_at refreshed
     assert conn.execute("SELECT COUNT(*) FROM binaries").fetchone()[0] == 1  # no duplicate row
     conn.close()
+
+
+# ── a timeout is deterministic: do not re-run it at a budget that already answered ────
+#
+# The cost this exists to stop, measured on real firmware: one 14MB binary that times out is
+# re-attempted on every scan, burning the full isolated-retry budget each time to re-learn what
+# the previous scan already recorded. Nothing about the attempt differs, so neither does the
+# result. What follows is the set of things that CAN differ, each with its own test.
+
+_BASE = 300  # config.ghidra.headless_timeout_seconds — the default, and the value in use
+# The measured size of the real binary this change came from: 14.1MB, whose budget works out to
+# 846s against an 1800s ceiling. Used verbatim so the "raising the ceiling changes nothing here"
+# case below is the actual case, not a rounded stand-in for it.
+_REAL_TIMED_OUT_SIZE = 14789215
+# Over 30MB at base 300, which is where the doubled budget passes the ceiling and the ceiling
+# starts to bind. Derived, not picked: 2 * int(300 * mb / 10) > 1800  ->  mb > 30.
+_CEILING_BOUND_SIZE = 31 * 1024 * 1024
+
+
+def _sized_file(tmp_path: Path, name: str, size_bytes: int) -> Path:
+    """A file that exists only to have a SIZE. Sparse, so a 31MB fixture costs no disk.
+
+    Real bytes are needed because the budget is computed from ``stat().st_size`` — a fabricated
+    size would test the arithmetic and not the reading of it."""
+    p = tmp_path / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("wb") as fh:
+        fh.truncate(size_bytes)
+    return p
+
+
+def _rec_for(path: Path, sha: str) -> ElfRecord:
+    return ElfRecord(
+        path=path,
+        name=path.name,
+        arch="ARM:LE:32:v7",
+        elf_type="executable",
+        sha256=sha,
+        dt_needed=[],
+        protections={},
+        size=path.stat().st_size,
+    )
+
+
+def _record_failure(
+    conn: sqlite3.Connection,
+    sha: str,
+    *,
+    budget: int | None,
+    pass_version: str | None,
+    reason: str = "timeout",
+) -> None:
+    """Put a row in the state the pipeline leaves a failed attempt in."""
+    conn.execute(
+        "UPDATE binaries SET ghidra_ok=0, ghidra_status='failed', ghidra_status_reason=?, "
+        "timeout_budget=?, timeout_pass_version=? WHERE sha256=?",
+        (reason, budget, pass_version, sha),
+    )
+    conn.commit()
+
+
+def _timed_out_at_current_budget(
+    tmp_path: Path, size_bytes: int
+) -> tuple[sqlite3.Connection, ElfRecord, int]:
+    """A DB holding one binary that timed out at exactly the budget this scan would hand it."""
+    from treasure_map.lib.analyze.ghidra_runner import retry_budget_seconds
+
+    conn = open_db(tmp_path / "analysis.db")
+    rec = _rec_for(_sized_file(tmp_path, "big_daemon", size_bytes), "deadbeef")
+    ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    budget = retry_budget_seconds(rec.path, _BASE)
+    assert budget is not None
+    _record_failure(conn, rec.sha256, budget=budget, pass_version="p1")
+    return conn, rec, budget
+
+
+def test_a_timeout_at_a_budget_this_scan_repeats_is_not_re_run(tmp_path: Path) -> None:
+    """★ THE property. Same bytes, same extractor, same budget — so the same failure.
+
+    Before this, a ``ghidra_ok=0`` row was dirty unconditionally, and a timeout is a ghidra_ok=0
+    row. The re-run was guaranteed to end where the last one did; the only thing it produced was
+    the wall-clock it consumed.
+
+    MUTATION (must go RED): drop the skip from the dirty set (every ghidra_ok=0 row dirty again)."""
+    conn, rec, _budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+    _, dirty = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 not in dirty
+    conn.close()
+
+
+def test_more_time_than_it_had_makes_the_retry_a_different_attempt(tmp_path: Path) -> None:
+    """★ The load-bearing half: the skip must not outlive the reason for it.
+
+    A raised ceiling means the binary would now get MORE than it failed under, so the next attempt
+    is not the one that already happened. Getting this wrong is worse than not skipping at all: the
+    binary would be frozen out of every future scan no matter how much time it was offered.
+
+    ★ The fixture is deliberately CEILING-BOUND, asserted below rather than assumed. The budget is
+    ``min(ceiling, 2 * scaled)``, so raising the ceiling only moves it for a binary whose doubled
+    scaled budget the ceiling was actually clipping. On a smaller binary — the real 14MB one that
+    prompted all this, whose budget is 846s against an 1800s ceiling — raising the ceiling changes
+    nothing and NOT re-running is the correct answer. A test built on that binary would pass while
+    testing nothing, which is why the control case below is here too.
+
+    MUTATION (must go RED): compare against the phase-1 ``_dynamic_timeout`` instead of the
+    isolated-retry budget — ``min(ceiling, scaled)`` does not move when the ceiling rises, so the
+    binary stays skipped forever."""
+    from treasure_map.lib.analyze import ghidra_runner
+    from treasure_map.lib.analyze.ghidra_runner import _scaled_timeout
+
+    conn, rec, budget = _timed_out_at_current_budget(tmp_path, _CEILING_BOUND_SIZE)
+    size = rec.path.stat().st_size
+    assert _scaled_timeout(size, _BASE) * 2 > ghidra_runner._TIMEOUT_CEILING_SECONDS, (
+        "fixture is not ceiling-bound — raising the ceiling would legitimately not change its "
+        "budget, and this test would pass without exercising anything"
+    )
+    assert budget == ghidra_runner._TIMEOUT_CEILING_SECONDS
+
+    _, before = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 not in before  # skipped at the old ceiling
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ghidra_runner, "_TIMEOUT_CEILING_SECONDS", 2400)
+        _, after = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 in after  # ...and re-attempted once the ceiling is raised
+    conn.close()
+
+
+def test_a_raised_ceiling_that_changes_no_budget_changes_no_decision(tmp_path: Path) -> None:
+    """The control for the test above, and the reason it needs a 31MB fixture.
+
+    A binary well under the ceiling has a budget the ceiling is not clipping, so raising the ceiling
+    hands it nothing new and skipping it stays right. Stated as a test because the tempting fixture
+    — the real 14MB binary this whole change came from — behaves exactly this way, and a
+    self-healing test written on it would be green without a self-heal behind it."""
+    from treasure_map.lib.analyze import ghidra_runner
+    from treasure_map.lib.analyze.ghidra_runner import _scaled_timeout
+
+    conn, rec, budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+    assert _scaled_timeout(rec.path.stat().st_size, _BASE) * 2 < 1800  # not ceiling-bound
+    assert budget == 846
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ghidra_runner, "_TIMEOUT_CEILING_SECONDS", 2400)
+        _, dirty = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 not in dirty
+    conn.close()
+
+
+def test_a_larger_base_timeout_re_runs_it(tmp_path: Path) -> None:
+    """The other way the budget grows: the configured base. Same rule, no special case for it."""
+    conn, rec, _budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+    _, same = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 not in same
+    _, bigger = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE * 2)
+    assert rec.sha256 in bigger
+    conn.close()
+
+
+def test_an_edited_extractor_re_runs_it(tmp_path: Path) -> None:
+    """A pass edit changes what the attempt would DO, so the old timeout stops answering for it.
+
+    This needs its own recorded fingerprint: a row's ``pass_version`` describes the output it
+    produced, and a failed attempt produces none, so the pipeline deliberately leaves that column
+    alone on failure. Reading it here would find NULL on every timeout and the skip would never
+    fire at all.
+
+    MUTATION (must go RED): skip regardless of the recorded fingerprint."""
+    conn, rec, _budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+    _, unchanged = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 not in unchanged
+    _, edited = ingest_elfs(conn, [rec], pass_version="p2", timeout_base=_BASE)
+    assert rec.sha256 in edited
+    conn.close()
+
+
+def test_changed_content_is_a_different_binary_and_runs(tmp_path: Path) -> None:
+    """The content axis, which costs nothing to hold: rows are keyed BY sha256.
+
+    Different bytes are a different row with no recorded timeout, so it is dirty as a new binary
+    would be. Written down because "we also check the content" is easy to believe about code that
+    does not, and here the check is the lookup itself."""
+    conn, rec, _budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+    changed = _rec_for(rec.path, "feedface")  # same file, new content hash
+    _, dirty = ingest_elfs(conn, [changed], pass_version="p1", timeout_base=_BASE)
+    assert "feedface" in dirty
+    conn.close()
+
+
+def test_a_non_timeout_failure_is_still_re_run_every_scan(tmp_path: Path) -> None:
+    """Only timeouts are deterministic in the way this relies on. Nothing else changes behaviour.
+
+    An import failure or a crash can be a one-off — a JVM under memory pressure, a race — and
+    whether those self-heal on a retry has not been measured here, so they keep being retried
+    exactly as before. Deciding otherwise would need attempt counts and a measured self-heal rate;
+    inventing a policy for a failure nobody has hit is how a scan quietly stops looking.
+
+    MUTATION (must go RED): drop the reason filter and skip any failed row."""
+    from treasure_map.lib.analyze.ghidra_runner import retry_budget_seconds
+
+    conn = open_db(tmp_path / "analysis.db")
+    rec = _rec_for(_sized_file(tmp_path, "weird.so", _REAL_TIMED_OUT_SIZE), "deadbeef")
+    ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    budget = retry_budget_seconds(rec.path, _BASE)
+    for reason in ("import_failed", "no_output", "incomplete"):
+        _record_failure(conn, rec.sha256, budget=budget, pass_version="p1", reason=reason)
+        _, dirty = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+        assert rec.sha256 in dirty, reason
+    conn.close()
+
+
+def test_nothing_recorded_to_compare_against_means_re_run(tmp_path: Path) -> None:
+    """A skip is positively earned. Absence of a fact is never read as "nothing changed".
+
+    Two ways a timeout row can carry no comparison: it failed before any of this was recorded (both
+    columns NULL on an older DB), or the caller tracks no pass version. Both re-run.
+
+    MUTATION (must go RED): treat a NULL budget or a NULL fingerprint as a match."""
+    conn, rec, budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+
+    _record_failure(conn, rec.sha256, budget=None, pass_version="p1")
+    _, no_budget = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 in no_budget
+
+    _record_failure(conn, rec.sha256, budget=budget, pass_version=None)
+    _, no_fingerprint = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 in no_fingerprint
+
+    _record_failure(conn, rec.sha256, budget=budget, pass_version="p1")
+    _, caller_tracks_no_pass = ingest_elfs(conn, [rec], pass_version=None, timeout_base=_BASE)
+    assert rec.sha256 in caller_tracks_no_pass
+    conn.close()
+
+
+def test_a_binary_that_cannot_be_measured_is_re_run_and_said_out_loud(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The budget comes from the file's size, so an unreadable file has no budget to compare.
+
+    Both silent answers are wrong here and in opposite directions — skip it and a binary vanishes
+    from every future scan on a number nobody computed; re-run it quietly and it burns the budget
+    forever with no trace. It re-runs, and it says why.
+
+    MUTATION (must go RED): let the unmeasurable case fall through to a skip, or drop the log."""
+    conn, rec, _budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+    rec.path.unlink()
+    with caplog.at_level("WARNING"):
+        _, dirty = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 in dirty
+    assert any("cannot measure" in r.message for r in caplog.records)
+    conn.close()
+
+
+def test_the_escape_hatches_re_run_everything(tmp_path: Path) -> None:
+    """--force-retry and either --reanalyze form ignore the skip: a judgement must be
+    overridable, and this one is a judgement about wall clock, not about the binary."""
+    conn, rec, _budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+    _, forced = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE, force_retry=True)
+    assert rec.sha256 in forced
+    _, all_ = ingest_elfs(
+        conn, [rec], pass_version="p1", timeout_base=_BASE, reanalyze=REANALYZE_ALL
+    )
+    assert rec.sha256 in all_
+    _, named = ingest_elfs(
+        conn, [rec], pass_version="p1", timeout_base=_BASE, reanalyze="big_daemon"
+    )
+    assert rec.sha256 in named
+    conn.close()
+
+
+def test_a_caller_that_tracks_no_budget_skips_nothing(tmp_path: Path) -> None:
+    """No ``timeout_base``, no skipping — the default behaviour is exactly what it was.
+
+    Same convention ``pass_version`` already uses in this function: a caller that does not supply
+    the dimension does not get it applied to them."""
+    conn, rec, _budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+    _, dirty = ingest_elfs(conn, [rec], pass_version="p1")
+    assert rec.sha256 in dirty
+    conn.close()
+
+
+def test_skipping_the_re_run_does_not_remove_it_from_the_incomplete_surfacing(
+    tmp_path: Path,
+) -> None:
+    """★ The hard gate: not re-running it is not the same as it being fine.
+
+    A skipped binary keeps ghidra_ok=0, keeps ``failed``, keeps 0 functions and keeps its row in
+    this scan — so it goes on being named as incomplete, with the timeout as the reason. The two
+    are independent, and they have to be: a binary nobody could analyze reads as one with nothing
+    in it to every consumer downstream, and "the scan got faster" would be the only visible
+    difference.
+
+    MUTATION (must go RED): have the skip mark the row ok_empty (the tempting way to stop it being
+    re-examined) — it drops straight out of the surfacing."""
+    from treasure_map.lib.facts import list_incomplete_binaries
+
+    conn, rec, _budget = _timed_out_at_current_budget(tmp_path, _REAL_TIMED_OUT_SIZE)
+    _, dirty = ingest_elfs(conn, [rec], pass_version="p1", timeout_base=_BASE)
+    assert rec.sha256 not in dirty  # skipped...
+
+    listed = list_incomplete_binaries(conn)
+    assert [(e["binary"], e["reason"]) for e in listed] == [("big_daemon", "timeout")]
+    conn.close()

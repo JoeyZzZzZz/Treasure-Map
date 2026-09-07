@@ -11,6 +11,7 @@ to `tmap triage` (single renderer, no drift).
 from __future__ import annotations
 
 import json
+from dataclasses import fields as _dataclass_fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,6 +21,7 @@ from click.testing import CliRunner
 
 from treasure_map.cli.hunt_cli import scan
 from treasure_map.cli.hunt_cli import triage as triage_cmd
+from treasure_map.lib.analyze.pipeline import AnalyzeResult
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.atlas.models import InstanceRow
 from treasure_map.lib.atlas.writer import add_instance, upsert_pattern
@@ -41,9 +43,21 @@ class _DummyWorkspace:
         return None
 
 
-def _fake_analyze_result(db_path: Path) -> SimpleNamespace:
-    return SimpleNamespace(
-        db_path=db_path, binary_count=2, functions_ingested=9, incomplete_binaries=[]
+def _fake_analyze_result(db_path: Path) -> AnalyzeResult:
+    """A stand-in built FROM the real dataclass, not typed out by hand.
+
+    A hand-listed namespace goes stale the moment the command reads one more field, and it fails as
+    an AttributeError buried inside a CliRunner result rather than as anything readable. Deriving
+    the counters from ``AnalyzeResult`` means a new field cannot make this stub incomplete."""
+    non_counter = {"db_path", "elapsed", "incomplete_binaries", "timeout_skipped"}
+    counters = {f.name: 0 for f in _dataclass_fields(AnalyzeResult) if f.name not in non_counter}
+    counters.update(binary_count=2, functions_ingested=9)
+    return AnalyzeResult(
+        db_path=db_path,
+        elapsed=0.1,
+        incomplete_binaries=[],
+        timeout_skipped=[],
+        **counters,
     )
 
 
@@ -420,3 +434,54 @@ def test_scan_says_out_loud_when_the_hunt_was_skipped(
     assert "stored candidates kept as they are" in result.output
     assert "--rehunt" in result.output
     assert "candidates written" not in result.output
+
+
+# ── a skipped timeout is reported by the one-shot path too ───────────────────────────
+
+
+def test_scan_names_the_binaries_it_did_not_re_run_and_forwards_force_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one-shot path carries both halves: the escape hatch down, and the skip back up.
+
+    ``scan`` is the command most people actually run, and it is the one where a shorter wall clock
+    is most likely to be read as "there was less here". The same naming the standalone analyze does
+    has to survive the wrapper, and so does the flag that undoes the skip — a flag accepted at the
+    top and dropped on the way down is worse than no flag.
+
+    MUTATION (must go RED): drop the report call from scan, or stop passing force_retry through."""
+    _base_patches(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    async def _fake_analyze(*_: Any, force_retry: bool = False, **__: Any) -> AnalyzeResult:
+        seen["force_retry"] = force_retry
+        res = _fake_analyze_result(tmp_path / "analysis.db")
+        res.timeout_skipped.append(
+            {"binary": "big_daemon", "size_bytes": 14789215, "budget_seconds": 846}
+        )
+        return res
+
+    def _fake_hunt(db: Any, atlas: Any, **kwargs: Any) -> Any:
+        return _hunt_stats()
+
+    monkeypatch.setattr("treasure_map.lib.analyze.pipeline.run_analyze", _fake_analyze)
+    monkeypatch.setattr("treasure_map.lib.hunt.run_analyzer2", _fake_hunt)
+    monkeypatch.setattr("treasure_map.lib.query.triage", lambda conn, **_: [])
+
+    result = CliRunner().invoke(
+        scan,
+        [
+            str(_mkfs(tmp_path)),
+            "-w",
+            "router_v1",
+            "--atlas",
+            str(tmp_path / "atlas.db"),
+            "--force-retry",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["force_retry"] is True
+    assert "big_daemon" in result.output
+    assert "846s budget" in result.output
+    assert "--force-retry" in result.output

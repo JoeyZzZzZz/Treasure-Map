@@ -198,6 +198,12 @@ class GhidraResult:
     # 'no_output' / 'incomplete'. Recorded onto binaries.ghidra_status_reason for the incomplete
     # surfacing -- degrade must be visible AND explicable, not just a flat 'failed'.
     reason: str | None = None
+    # The wall-clock budget (seconds) the attempt behind THIS result actually ran under — recorded,
+    # not re-derived, because "re-scan may finish it" is only true if the next scan hands it MORE
+    # time. Measured rather than computed so a run that never reached the isolated retry (its phase
+    # crashed) records the smaller budget it really got, and next scan re-runs it. None when the
+    # result did not come from an attempt (a crash placeholder).
+    timeout_budget: int | None = None
 
 
 # ★ A binary that cannot finish within this even on an isolated retry is a genuine hang, not a
@@ -220,6 +226,17 @@ def adaptive_heap_mb(size_bytes: int) -> tuple[int, int]:
     return xmx, xms
 
 
+def _scaled_timeout(size_bytes: int, base: int) -> int:
+    """The size-scaled, ceiling-capped budget for a binary of ``size_bytes``. Pure — no filesystem.
+
+    Split out from ``_dynamic_timeout`` so the phase-2 budget below and the dirty check that
+    re-derives it share ONE formula. Two copies would agree until either was adjusted, and then a
+    binary would be compared against a budget nobody was going to give it."""
+    size_mb = size_bytes / 1024 / 1024
+    scaled = base if size_mb < 10 else int(base * (size_mb / 10))
+    return min(_TIMEOUT_CEILING_SECONDS, max(base, scaled))
+
+
 def _dynamic_timeout(binary: Path, base: int) -> int:
     """A per-binary analysis timeout scaled by file size, replacing the flat one-size-fits-all.
 
@@ -228,11 +245,38 @@ def _dynamic_timeout(binary: Path, base: int) -> int:
     out under a budget sized for a 200K one — and why a truly hung binary still cannot run forever.
     """
     try:
-        size_mb = binary.stat().st_size / 1024 / 1024
+        size_bytes = binary.stat().st_size
     except OSError:
         return base
-    scaled = base if size_mb < 10 else int(base * (size_mb / 10))
-    return min(_TIMEOUT_CEILING_SECONDS, max(base, scaled))
+    return _scaled_timeout(size_bytes, base)
+
+
+def retry_budget_seconds(binary: Path, base: int) -> int | None:
+    """The budget a binary's LAST attempt gets: the serial isolated retry's doubled, capped one.
+
+    THE number to compare a timed-out binary against, and the reason it is a function rather than an
+    expression at the two call sites. ``run_all`` spends it in phase 2, and the dirty check asks
+    with it whether a re-run would hand the binary MORE time than it had when it failed. A timeout
+    is deterministic: at the same budget the same binary times out again, so re-running it is a
+    guaranteed-identical result bought at half an hour of wall clock. Only a bigger budget makes the
+    attempt a different one.
+
+    ★ Phase 2's budget, deliberately, not phase 1's. A binary that fails in the parallel phase is
+    re-run serially at ``2 * _dynamic_timeout`` (capped), so THAT is the budget it finally failed
+    under. Comparing against phase 1's would also break the self-heal in the direction that costs
+    most: ``_dynamic_timeout`` is ``min(ceiling, scaled)`` and for most binaries ``scaled`` is well
+    under the ceiling, so raising the ceiling would not move it and a binary that should now get
+    more time would go on being skipped. ``min(ceiling, 2 * scaled)`` does move with the ceiling
+    exactly when the doubled budget is what the ceiling was clipping.
+
+    None when the file cannot be measured. A budget that cannot be computed must not be compared:
+    the caller re-runs rather than deciding on a number it does not have.
+    """
+    try:
+        size_bytes = binary.stat().st_size
+    except OSError:
+        return None
+    return min(_TIMEOUT_CEILING_SECONDS, _scaled_timeout(size_bytes, base) * 2)
 
 
 def find_headless(config: GhidraConfig) -> Path:
@@ -576,6 +620,10 @@ class GhidraRunner:
             log_path=r1.log_path,
             stderr_tail=r1.stderr_tail,
             reason="import_failed" if import_failed else last.reason,
+            # The budget of the attempt that actually failed last — ``last`` is the retry when one
+            # ran, ``r1`` when none did. Taking r1's would under-report the time this binary was
+            # given and make the next scan skip it on a budget it never had.
+            timeout_budget=last.timeout_budget,
         )
 
     def _run_once(
@@ -636,6 +684,7 @@ class GhidraRunner:
             log_path=log_path if log_path.exists() else None,
             stderr_tail=stderr_raw if stderr_raw else None,
             reason=reason,
+            timeout_budget=timeout,
         )
 
     def run_all(
@@ -726,9 +775,12 @@ class GhidraRunner:
             try:
                 for k, i in enumerate(failed, 1):
                     rec = records[i]
-                    retry_timeout = min(
-                        _TIMEOUT_CEILING_SECONDS, _dynamic_timeout(rec.path, base) * 2
-                    )
+                    budget = retry_budget_seconds(rec.path, base)
+                    if budget is None:
+                        # Unmeasurable file: the same fallback the scaling has always used (an
+                        # unscaled base, doubled and capped), so behaviour here is unchanged.
+                        budget = min(_TIMEOUT_CEILING_SECONDS, base * 2)
+                    retry_timeout = budget
                     try:
                         r = self.run_ghidra(
                             rec.path, output_dir, retry_timeout, rec.arch, rec.sha256[:8], False

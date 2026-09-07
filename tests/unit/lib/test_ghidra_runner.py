@@ -716,3 +716,80 @@ def test_run_all_phase2_failure_stays_failed_with_reason(tmp_path: Path) -> None
         results = runner.run_all([rec], tmp_path / "out")
     assert calls["n"] == 2  # phase 1 + phase 2, then it stays failed
     assert results[0].success is False and results[0].reason == "timeout"
+
+
+# ── the budget a failure was given: recorded, and re-derivable by ONE formula ─────────
+
+
+def test_retry_budget_is_the_isolated_retrys_and_it_is_what_run_all_spends(
+    tmp_path: Path,
+) -> None:
+    """One formula for "what budget does this binary's last attempt get", and both readers use it.
+
+    ``run_all`` spends it in phase 2 and the dirty check re-derives it to ask whether a re-run would
+    be a different attempt. Two copies of the expression would agree right up until one was
+    adjusted, and then a binary would be measured against a budget nobody was going to hand it. So
+    the value is read back out of the subprocess call phase 2 actually makes.
+
+    MUTATION (must go RED): compute phase 2's budget inline again instead of calling the shared
+    function, then change one of them."""
+    from treasure_map.lib.analyze.ghidra_runner import retry_budget_seconds
+
+    rec = _big_rec(tmp_path)
+    _sized_file(rec.path, 28)
+    base = GhidraConfig().headless_timeout_seconds
+    seen: list[int] = []
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        seen.append(timeout)
+        return -1, "timeout"
+
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        runner.run_all([rec], tmp_path / "out")
+
+    expected = retry_budget_seconds(rec.path, base)
+    assert expected == min(1800, int(300 * 2.8) * 2)
+    # _run_subprocess is handed the budget + 60s of overhead; phase 2 is the second call.
+    assert seen[1] - 60 == expected
+
+
+def test_a_failure_records_the_budget_its_last_attempt_ran_under(tmp_path: Path) -> None:
+    """The recorded budget is measured, not computed — and it is the LAST attempt's, not the first.
+
+    A binary that fails twice failed at the bigger of the two, and that is the number the next scan
+    has to beat. Recording the first attempt's would understate what the binary was given, and the
+    next scan would then skip it on time it never actually had.
+
+    MUTATION (must go RED): carry ``r1.timeout_budget`` into the synthesized failure result, or
+    compute the budget at record time instead of stamping the attempt."""
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    binary = tmp_path / "b"
+    _write_small_elf(binary)
+
+    def fake_sub(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
+        return -1, "timeout"
+
+    runner = _make_runner(tmp_path)
+    with patch(f"{MODULE}._run_subprocess", fake_sub):
+        one = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8="dead", retry=False
+        )
+        two = runner.run_ghidra(
+            binary, output_dir, timeout=60, arch="x86:LE:64:default", sha8="dead", retry=True
+        )
+    assert one.timeout_budget == 60  # a single attempt: the budget it ran under
+    assert two.timeout_budget == 120  # retried at the doubled budget: THAT is what it failed at
+
+
+def test_a_result_that_never_ran_records_no_budget(tmp_path: Path) -> None:
+    """A crash placeholder carries no budget, and must not pretend to.
+
+    ``run_all`` synthesizes one of these when a worker raises before any attempt completed. A zero
+    or a guessed budget there would be a number the binary never received; None reaches the dirty
+    check as "nothing to compare" and it re-runs."""
+    from treasure_map.lib.analyze.ghidra_runner import GhidraResult
+
+    placeholder = GhidraResult(binary=tmp_path / "b", output_file=None, success=False, elapsed=0.0)
+    assert placeholder.timeout_budget is None

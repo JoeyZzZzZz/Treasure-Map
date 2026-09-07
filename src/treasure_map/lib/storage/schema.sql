@@ -33,6 +33,17 @@ CREATE TABLE IF NOT EXISTS binaries (
                                            --   when undetectable, NULL when produced before this was
                                            --   recorded); rolled up per run so a cross-version diff
                                            --   can tell a decompiler change from a firmware change
+    timeout_budget    INTEGER,             -- seconds the LAST failed attempt actually ran under.
+                                           --   A timeout is deterministic, so the same budget
+                                           --   reproduces it; the dirty check re-runs the binary
+                                           --   only when the budget it would get now is LARGER.
+                                           --   NULL = no budget recorded (pre-feature failure, or
+                                           --   never failed) -> compare nothing, re-run
+    timeout_pass_version TEXT,             -- extraction fingerprint that failed attempt ran under.
+                                           --   Separate from pass_version, which describes a row's
+                                           --   OUTPUT and is deliberately left untouched on
+                                           --   failure; a failed attempt has no output but does
+                                           --   have code, and the skip must lapse when that changes
     strings_total     INTEGER,             -- true count of matching defined strings (>= stored); NULL
                                            --   on binaries exported before honest truncation existed
     strings_truncated INTEGER DEFAULT 0,   -- 1 = the stored strings list is a prefix (cap/cancel hit),

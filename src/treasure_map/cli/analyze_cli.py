@@ -34,6 +34,41 @@ def _warn_incomplete(incomplete: list[str]) -> None:
     )
 
 
+def _report_timeout_skips(skipped: list[dict[str, Any]]) -> None:
+    """Name the binaries no Ghidra time was spent on this scan, and why.
+
+    ★ Red-line (a skip must be visible): these are binaries that timed out and were NOT re-run
+    because this scan would hand them the same budget, which a timeout has already answered. The
+    scan therefore finishes faster while covering less, and the only thing that makes those two
+    tellable apart is saying so. Silence here reads as "it went fast", which is the wrong half.
+
+    Printed alongside the incomplete warning, not instead of it: they are still incomplete, and a
+    reader who sees only this line should still learn that from the other.
+
+    The knob named is the configured base timeout, deliberately, and not the ceiling. The budget is
+    ``min(ceiling, 2 * size-scaled base)``, so the ceiling only binds for binaries big enough for
+    the doubled budget to reach it — over ~30MB at the default base. For the 14MB binary that
+    prompted this, the budget is 846s against an 1800s ceiling: raising the ceiling moves nothing
+    and the advice would send someone to change a number that cannot help them."""
+    if not skipped:
+        return
+    click.echo(
+        f"\n  skipped {len(skipped)} binary/ies that timed out at the current budget "
+        "(same content, same extractor — a re-run reproduces the timeout):"
+    )
+    for entry in skipped[:20]:
+        size = entry.get("size_bytes") or 0
+        budget = entry.get("budget_seconds")
+        budget_txt = f"{budget}s budget" if budget is not None else "budget unrecorded"
+        click.echo(
+            f"    - {entry['binary']} ({size / 1024 / 1024:.1f}MB, timed out at {budget_txt}) — "
+            "still listed incomplete; raise ghidra.headless_timeout_seconds or --force-retry "
+            "to re-attempt"
+        )
+    if len(skipped) > 20:
+        click.echo(f"    … and {len(skipped) - 20} more")
+
+
 _ANALYZE_EPILOG = """\
 Examples:
 
@@ -106,6 +141,14 @@ scopes that to just the binary you are validating.
     "with no flag re-runs every binary the edited pass invalidated (the full-update path). Also "
     "the escape hatch for a single binary stuck in a bad cached state.",
 )
+@click.option(
+    "--force-retry",
+    is_flag=True,
+    default=False,
+    help="Also re-attempt binaries that timed out at a budget this scan would repeat, which are "
+    "skipped by default (a timeout is deterministic — the same budget reproduces it). Use after "
+    "raising the timeout, or on a machine with more to spare.",
+)
 def analyze(
     fs_root: Path,
     workspace: str | None,
@@ -113,6 +156,7 @@ def analyze(
     skip_non_binary: bool,
     skip_ingesters: tuple[str, ...],
     reanalyze: str | None,
+    force_retry: bool,
 ) -> None:
     """Analyze an extracted firmware filesystem root.
 
@@ -154,6 +198,7 @@ def analyze(
                     skip_non_binary=skip_non_binary,
                     skip_ingesters=frozenset(skip_ingesters),
                     reanalyze=reanalyze,
+                    force_retry=force_retry,
                 )
             )
     except KeyboardInterrupt:
@@ -195,4 +240,5 @@ def analyze(
     click.echo(f"  Web endpoints: {result.web_endpoints_ingested}")
     click.echo(f"  Symlinks recorded: {result.symlinks_recorded}")
     click.echo(f"  DB       : {result.db_path}")
+    _report_timeout_skips(result.timeout_skipped)
     _warn_incomplete(result.incomplete_binaries)
