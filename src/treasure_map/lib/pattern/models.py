@@ -51,6 +51,16 @@ class PatternMatch:
     structural_fingerprint: str
     fingerprint_algo_version: str
     evidence: str
+    # WHICH CALL in the function this match is about, for a shape emitted per CALLSITE rather than
+    # per function. ``sink_callsite_index`` orders the function's callsites of this sink class
+    # across callee names; ``sink_callsite_occurrence`` is the ordinal among calls to THIS callee,
+    # which is what a per-call reader needs (see classes.copy_callsites). Both stay None for a
+    # function-level match — the shapes that emit one candidate per function, and the copy shape
+    # when no call to its callee can be located in the decompiled text. None means "not anchored
+    # to a callsite", never "the first one": a reader that defaulted it to 0 would silently claim
+    # a precision the scan did not reach.
+    sink_callsite_index: int | None = None
+    sink_callsite_occurrence: int | None = None
 
 
 @dataclass(frozen=True)

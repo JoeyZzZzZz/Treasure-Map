@@ -614,3 +614,180 @@ def test_shape_scan_invariant_pure() -> None:
     assert shape_scan_invariant_holds(_stats(3, 1, 2)) is True
     assert shape_scan_invariant_holds(_stats(3, 1, 0)) is False  # one went missing
     assert shape_scan_invariant_holds(_stats(3, 2, 2)) is False  # one counted twice
+
+
+# ── Pattern B — one candidate per copy CALLSITE ──────────────────────────────────────
+#
+# The unit a copy candidate describes is a CALL, not a function. One row per function made the
+# function's other copies unrepresented, and picked which one to show by which callee name sorted
+# first — so a function copying a fixed 4 bytes and then a caller-supplied length reported the
+# fixed one, for both.
+
+# MC-2 fixtures. A and C must be RED before the fix (1 candidate each); B is the control that must
+# stay GREEN either way, so a mutation that breaks emission is not mistaken for the fix working.
+_COPY_A = "memcpy(dst, src, 4); memcpy(other, src, len);"  # 1 fixed + 1 variable
+_COPY_B = "memcpy(dst, src, 4);"  # 1 fixed only — the control
+_COPY_C = "memcpy(a, src, 4); memcpy(b, src, n); memcpy(c, src, m);"  # 1 fixed + 2 variable
+
+# MC-1 counts callsites with its OWN matcher rather than by calling the enumerator under test. The
+# NAMES come from the shared COPY set (a test carrying its own copy of the vocabulary would go
+# quietly stale the day a callee is added); the counting is the test's.
+_VISIBLE_COPY_CALL = re.compile(rf"\b(?:{'|'.join(sorted(COPY))})\s*\(")
+
+
+def _copy_matches(tmp_path: Path, pseudocode: str, callees: list[str] | None = None) -> list:  # type: ignore[type-arg]
+    """The copy candidates one function yields, scanned through the real pipeline."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "svcd",
+                "funcs": [
+                    {
+                        "name": "handler",
+                        "pseudocode": pseudocode,
+                        "callees": callees or ["memcpy"],
+                    }
+                ],
+            }
+        ],
+    )
+    return [m for m in scan(db).matches if m.sink_class == "copy"]
+
+
+def test_each_copy_callsite_gets_its_own_candidate(tmp_path: Path) -> None:
+    """MC-2. Two copies in a function are two candidates; one copy is still one.
+
+    Before per-callsite emission all three fixtures produced exactly one candidate, anchored at the
+    function and reporting the FIRST copy's length. The second and third calls had no row anywhere
+    — not a low-ranked row, no row — so no ordering change could have surfaced them.
+
+    MUTATION (must go RED on A and C, and stay GREEN on B): return a single function-level match
+    from pattern_b again (``return [_match(..., sorted(cc.copy)[0])]``). Measured: A 2 -> 1, C
+    3 -> 1, B 1 -> 1."""
+    assert len(_copy_matches(tmp_path / "a", _COPY_A)) == 2
+    assert len(_copy_matches(tmp_path / "b", _COPY_B)) == 1
+    assert len(_copy_matches(tmp_path / "c", _COPY_C)) == 3
+
+
+def test_copy_candidate_count_equals_the_visible_callsites(tmp_path: Path) -> None:
+    """MC-1 site coverage: as many candidates as there are copy calls to see, no more, no fewer.
+
+    Counted here with this test's own matcher over the same text, so the check is not the
+    enumerator agreeing with itself. Covers the multi-callee case, where the two ordinals a match
+    carries (position among ALL copy calls vs among calls to ITS callee) stop being the same
+    number.
+
+    MUTATION (must go RED): emit per callee NAME instead of per callsite (one match per entry of
+    ``cc.copy``) — 4 visible calls, 2 candidates."""
+    bodies = {
+        "one": _COPY_B,
+        "two": _COPY_A,
+        "three": _COPY_C,
+        "mixed": "memcpy(a,b,4); strcpy(x,y); memcpy(c,d,n); strncpy(e,f,g);",
+    }
+    for label, body in bodies.items():
+        matches = _copy_matches(tmp_path / label, body, ["memcpy", "strcpy", "strncpy"])
+        assert len(matches) == len(_VISIBLE_COPY_CALL.findall(body)), label
+
+
+def test_callsite_ordinals_run_in_source_order_across_callee_names(tmp_path: Path) -> None:
+    """The two ordinals are different numbers and each says what it says.
+
+    ``sink_callsite_index`` orders every copy call in the function, across callee names, so it names
+    a callsite the same way on every re-scan. ``sink_callsite_occurrence`` counts within ONE callee,
+    which is the number the size reader indexes with — hand it the index instead and the third call
+    below (index 2, but only the SECOND memcpy) reads a call that is not there.
+
+    MUTATION (must go RED): order the sites by callee name instead of by position, or set
+    occurrence = index."""
+    matches = _copy_matches(
+        tmp_path / "ord", "memcpy(a,b,4); strcpy(x,y); memcpy(c,d,n);", ["memcpy", "strcpy"]
+    )
+    assert [(m.sink_callsite_index, m.evidence, m.sink_callsite_occurrence) for m in matches] == [
+        (0, "memcpy", 0),
+        (1, "strcpy", 0),
+        (2, "memcpy", 1),
+    ]
+
+
+def test_copy_callee_never_spelled_out_still_yields_one_candidate(tmp_path: Path) -> None:
+    """A callee the decompiled body never writes as a call is still a candidate — the recall floor.
+
+    ``pcVar1 = memcpy;`` followed by an indirect call through the pointer is a real and common
+    decompilation: the callee list names the copy, the text contains no ``memcpy(``. Enumerating
+    callsites there yields nothing, and a detector that emitted per callsite and stopped would have
+    traded the split for a silent recall loss — measured at 49 of 1380 copy-carrying functions on
+    one real firmware.
+
+    Such a candidate carries NO callsite ordinal. That is the honest label: it is the function-level
+    match it always was, and calling it "callsite 0" would claim a call nobody located.
+
+    MUTATION (must go RED): ``return []`` when the enumerator finds no site."""
+    matches = _copy_matches(tmp_path / "ptr", "code *pcVar1; pcVar1 = memcpy; (*pcVar1)(d, s, n);")
+    assert len(matches) == 1
+    assert matches[0].sink_callsite_index is None
+    assert matches[0].sink_callsite_occurrence is None
+    assert matches[0].evidence == "memcpy"
+
+
+def test_per_callsite_siblings_share_one_fingerprint_and_one_scanned_function(
+    tmp_path: Path,
+) -> None:
+    """MC-4 + the recurrence ledgers: more candidates, same shape, same one function scanned.
+
+    Two things ride on this. The fingerprint is over the SHAPE, so the siblings fold into one
+    pattern row — which is why the recurrence ledgers (distinct pseudocode hashes, distinct runs)
+    read the same after this split as before it and need no re-baselining. And the three function
+    counters live outside the detector loop, so a function that yields three candidates is still
+    one function scanned: Gate D's partition is untouched by how many candidates come out.
+
+    MUTATION (must go RED): add the callsite ordinal to the fingerprint basis, or move any of the
+    three counters inside the detector loop."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db = _make_db(
+        tmp_path,
+        [{"name": "svcd", "funcs": [{"name": "h", "pseudocode": _COPY_C, "callees": ["memcpy"]}]}],
+    )
+    res = scan(db)
+    copies = [m for m in res.matches if m.sink_class == "copy"]
+    assert len(copies) == 3
+    assert len({m.structural_fingerprint for m in copies}) == 1
+    assert res.stats.pattern_b == 3  # candidates
+    assert res.stats.functions_scanned == 1  # ...from one function
+    assert shape_scan_invariant_holds(res.stats)
+
+
+def test_function_level_shapes_still_yield_at_most_one(tmp_path: Path) -> None:
+    """The list contract did not turn the other four shapes into per-callsite ones.
+
+    They are about the function, and two system() calls in one function are one candidate exactly as
+    before. Stated as a test because "detectors return lists now" is the kind of change that quietly
+    generalizes to shapes it was never meant to touch.
+
+    MUTATION (must go RED): make any of the four emit per call."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "svcd",
+                "funcs": [
+                    {
+                        "name": "many",
+                        "pseudocode": (
+                            "system(a); system(b); printf(x); printf(y); "
+                            'fopen(p,"r"); fopen(q,"r");'
+                        ),
+                        "callees": ["system", "printf", "fopen"],
+                    }
+                ],
+            }
+        ],
+    )
+    res = scan(db)
+    per_class = {}
+    for m in res.matches:
+        per_class[m.sink_class] = per_class.get(m.sink_class, 0) + 1
+    assert per_class == {"cmd": 1, "fmt_string": 1, "path_sink": 1}

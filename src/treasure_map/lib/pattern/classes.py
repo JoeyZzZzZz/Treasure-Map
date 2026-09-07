@@ -10,6 +10,8 @@ generic, public C/libc and common-embedded API names; no vendor-proprietary symb
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 # External-input getters, split by strength of external controllability (neutral,
 # mechanism-based). Strength gates reachability grading only; R-pattern's shape detection
@@ -355,3 +357,56 @@ def path_arg_ident(pseudocode: str, sink_name: str) -> str | None:
         if ident is not None:
             return ident.group(0)
     return None
+
+
+# ── Call locations: one authority on "where are the calls to NAME" ──────────────────────────────
+
+
+def call_offsets(pseudocode: str, name: str) -> tuple[int, ...]:
+    """Offsets of the opening parenthesis of every textual call to ``name``, in source order.
+
+    THE single authority on where a function's calls to one callee are, shared by the callsite
+    enumerator below and by the per-call argument readers in the reachability layer. Sharing it is
+    the point: a candidate anchored at "the 2nd memcpy call" and the call whose arguments actually
+    get read have to be the SAME call. Two counts derived from two copies of this regex agree only
+    by coincidence, and stop agreeing the first time either one is adjusted.
+    """
+    return tuple(m.end() - 1 for m in re.finditer(rf"\b{re.escape(name)}\s*\(", pseudocode))
+
+
+@dataclass(frozen=True)
+class CopyCallsite:
+    """One textual call to a copy callee inside a function's pseudocode.
+
+    ``index`` orders every copy call in the function by position, ACROSS copy names, so it names a
+    callsite the same way on every re-scan of the same body. ``occurrence`` is the 0-based ordinal
+    of this call among calls to ``sink_name`` alone — the number a per-call reader needs to look at
+    THIS call rather than at the first one. They differ as soon as a function copies with two
+    different callees (measured: 66 of 1380 copy-carrying functions on one real firmware).
+    """
+
+    index: int
+    sink_name: str
+    occurrence: int
+
+
+def copy_callsites(pseudocode: str, sink_names: Iterable[str]) -> tuple[CopyCallsite, ...]:
+    """Every textual call to one of ``sink_names``, in source order.
+
+    A name with no textual call contributes nothing. The callee list can name a callee the
+    decompiled body never spells out — ``pcVar1 = memcpy;`` followed by an indirect call through
+    the pointer is the common form — and inventing a callsite for it would anchor a candidate at a
+    call that is not there. What to do with an EMPTY result is the caller's decision and it is not
+    "emit nothing": on one real firmware 49 of 1380 copy-carrying functions are in that state, so a
+    caller that dropped them would trade a per-callsite gain for a silent recall loss.
+    """
+    sites = [
+        (offset, name, occurrence)
+        for name in sorted({n for n in sink_names if n})
+        for occurrence, offset in enumerate(call_offsets(pseudocode, name))
+    ]
+    sites.sort()
+    return tuple(
+        CopyCallsite(index=index, sink_name=name, occurrence=occurrence)
+        for index, (_offset, name, occurrence) in enumerate(sites)
+    )

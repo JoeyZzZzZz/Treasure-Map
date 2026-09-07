@@ -1229,6 +1229,12 @@ def _copy_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
             str(kind), "the length kind recorded here is not one this reader knows how to describe"
         ),
     }
+    # WHICH call this length belongs to. Present only when the producer recorded it: a candidate
+    # written before copy candidates were per-callsite has no callsite to name, and inventing one
+    # would say "the first call" about a row that was never about a particular call.
+    callsite = evidence.get("copy_callsite")
+    if callsite is not None:
+        out["callsite"] = callsite
     if out["clamp_seen"] or kind in ("clamp", "pointer_guard"):
         out["not_asserted"] = _SURFACE_NOT_BOUNDED
     if boundary and boundary != "reached_sink":

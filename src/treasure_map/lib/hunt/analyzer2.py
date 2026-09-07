@@ -86,7 +86,7 @@ from treasure_map.lib.hunt.exec_edges import (
 )
 from treasure_map.lib.hunt.facts import is_thin_cmd_wrapper
 from treasure_map.lib.hunt.fmt_provenance import constant_format_record, format_argument
-from treasure_map.lib.hunt.refs import _WRAPPER_AXIS, build_evidence_ref
+from treasure_map.lib.hunt.refs import _WRAPPER_AXIS, build_evidence_ref, callsite_suffix
 from treasure_map.lib.hunt.wrapper_propagation import (
     find_wrapper_propagated_candidates,
 )
@@ -1229,14 +1229,24 @@ def run_analyzer2(
                     continue
 
                 callees = _parse_callees(row.callees)
-                # For a format-string candidate the risky (non-literal) sink was already chosen by
-                # the recall detector and carried in evidence; anchor to it so a literal-exempt
-                # sibling sink (e.g. a printf("lit") alongside a syslog(buf)) is never anchored.
+                # Two sink classes have their concrete sink chosen by the DETECTOR and carried in
+                # evidence; anchor to that rather than re-deriving one from the callee list.
+                #   fmt_string — the risky (non-literal) sink, so a literal-exempt sibling (a
+                #                printf("lit") alongside a syslog(buf)) is never anchored.
+                #   copy       — the callee AT THIS CANDIDATE'S CALLSITE. Re-deriving would pick
+                #                one name for the whole function and hand a strcpy candidate the
+                #                memcpy that happens to sort first.
                 sink_name: str | None
-                if match.sink_class == "fmt_string":
+                if match.sink_class in ("fmt_string", "copy"):
                     sink_name = match.evidence
                 else:
                     sink_name = _sink_name_for(callees, match.sink_class)
+                # Which call to that sink this candidate is about. None (every function-level
+                # shape, and a copy whose call is not in the text) reads the first call, which is
+                # what every candidate did before per-callsite emission existed.
+                copy_occurrence = (
+                    0 if match.sink_callsite_occurrence is None else match.sink_callsite_occurrence
+                )
                 # The danger axis differs by sink: a path/file sink is graded on its per-sink PATH
                 # argument (fopen arg0, openat/unlinkat arg1, …), NOT arg0. Every other sink keeps
                 # the historical arg0 command-string axis, byte-for-byte.
@@ -1249,7 +1259,9 @@ def run_analyzer2(
                 if sink_name is None:
                     status, blocking = "unknown", None
                 else:
-                    verdict = grade_candidate(row.pseudocode, callees, sink_name)
+                    verdict = grade_candidate(
+                        row.pseudocode, callees, sink_name, copy_occurrence=copy_occurrence
+                    )
                     status, blocking = verdict.status, verdict.blocking_mechanism
 
                 # FP-suppression labels written into existing neutral fields (read-side ordering
@@ -1342,7 +1354,11 @@ def run_analyzer2(
                     # nothing reads it back into recall or the grade.
                     sites = entry_index.sites_for(row.binary_name, row.binary_path)
                     size_ev = build_size_evidence(
-                        pseudocode=row.pseudocode, sink_name=sink_name, entry_sites=sites
+                        pseudocode=row.pseudocode,
+                        sink_name=sink_name,
+                        entry_sites=sites,
+                        callsite_index=match.sink_callsite_index,
+                        occurrence=copy_occurrence,
                     )
                     _attach_edge_leads(
                         size_ev, edge_leads, row.binary_name, match.func_ref.func_name
@@ -1414,14 +1430,16 @@ def run_analyzer2(
                         exposure_shape=exposure_shape,
                         provenance_level=provenance,
                         # Neutral, RE-SCAN-STABLE per-instance locator = run + binary/function
-                        # anchor + sink-class hit. One function can match multiple sinks (e.g. cmd
-                        # and copy); each is a distinct instance, so the sink-class suffix keeps the
-                        # ref unique (it is the single anchor used by --explain, manual jump-back,
+                        # anchor + sink-class hit, plus the callsite ordinal when the candidate is
+                        # about one CALL rather than the whole function. One function can match
+                        # multiple sinks (e.g. cmd and copy) and can hold several calls to one of
+                        # them; each is a distinct instance, and the suffix is what keeps their
+                        # refs apart (it is the single anchor used by --explain, manual jump-back,
                         # and any durable per-ref judgement store — which is why it must not drift
-                        # across a re-scan; see build_evidence_ref).
+                        # across a re-scan; see build_evidence_ref / callsite_suffix).
                         evidence_ref=build_evidence_ref(
                             source_run_id,
-                            suffix=match.sink_class,
+                            suffix=callsite_suffix(match.sink_class, match.sink_callsite_index),
                             binary_sha256=row.binary_sha256,
                             binary_name=row.binary_name,
                             address=row.address,

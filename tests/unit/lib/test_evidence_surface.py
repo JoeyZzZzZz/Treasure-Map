@@ -173,6 +173,29 @@ def test_orphan_form_notes_stay_out_of_every_marker_set() -> None:
         assert orphan not in read, orphan
 
 
+def test_the_demotable_marker_set_is_exactly_the_one_written_out_here() -> None:
+    """The set that sinks a candidate out of the first screen, enumerated by hand and compared.
+
+    The other direction from the orphan check above: that one names markers that must stay OUT,
+    this one fixes the whole membership, so a marker ADDED to the set arrives here as a red test
+    instead of as a quietly larger demotion. Demotion is the only place the map removes something
+    from view, and it is meant to be spendable only on facts that PROVE the value is a compile-time
+    constant — a set that can grow unnoticed is a way to demote on facts that prove less.
+
+    The stake grew with per-callsite copy candidates: ``const_size`` now sinks one CALL rather than
+    a whole function, so a wrongly registered marker costs more rows than it used to.
+
+    MUTATION (must go RED): add any marker to PROVABLY_CONSTANT_MARKERS without listing it here."""
+    assert PROVABLY_CONSTANT_MARKERS == frozenset(
+        {
+            "const_sink_arg",  # sink's dangerous argument is a fixed .rodata string constant
+            "caller_constant",  # a constant supplied by the sole caller
+            "const_size",  # copy length is a literal constant, at THIS callsite
+            "sizeof_bound",  # copy length is a sizeof (non-controllable)
+        }
+    )
+
+
 # ── copy: the length picture ─────────────────────────────────────────────────────────
 
 

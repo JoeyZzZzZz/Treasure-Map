@@ -48,6 +48,38 @@ _WRAPPER_AXIS: dict[str, tuple[str, str]] = {
 }
 
 
+def callsite_suffix(sink_class: str, callsite_index: int | None) -> str:
+    """The ref suffix for a candidate: its sink class, plus the callsite ordinal when it has one.
+
+    A shape emitted per CALLSITE needs this or it does not survive being read back. Readers resolve
+    a ref to ONE instance (``WHERE evidence_ref = ? ORDER BY instance_id LIMIT 1``), so siblings
+    sharing a ref are not two candidates — the second one is silently not there, which is the same
+    disappearance the per-callsite split exists to undo. ``copy#0`` / ``copy#1`` keep them apart.
+
+    A candidate with no callsite ordinal keeps the bare class suffix it has always had, byte for
+    byte. Two reasons, both about not overstating: a function-level anchor is a different claim
+    from "the Nth call", and writing ``copy#0`` for a call that could not be located would dress a
+    fallback up as a precise hit.
+
+    ★ Callsite ordinals do change the refs of the per-callsite candidates themselves — the same
+    copy that answered to ``…@copy`` now answers to ``…@copy#0``. That is deliberate and it is the
+    honest direction: the old ref named a FUNCTION's copy, and once a function can hold several,
+    silently re-pointing that name at whichever call happens to sort first would hand an existing
+    judgement a different callsite without saying so. A ref that stops resolving is visible; one
+    that resolves to something else is not.
+
+    ★ SCOPE, stated because it is weaker than the rest of the ref: the ordinal counts calls in the
+    DECOMPILED TEXT, so it is a property of the decompiler's output rather than of the binary the
+    way an entry address is. Re-scanning the same firmware with the same decompiler reproduces the
+    body and therefore the ordinal, which is the stability a durable judgement store needs. A
+    decompiler UPGRADE is where the two anchors part company: the address survives it and the
+    ordinal need not, so a candidate's callsite ref can move while its function's does not. That is
+    the same regime as the cross-recompile boundary this module already declines to pay for — worth
+    naming here because the rest of the ref is stronger and would otherwise be read as covering it.
+    """
+    return sink_class if callsite_index is None else f"{sink_class}#{callsite_index}"
+
+
 def _norm_addr(address: str | None) -> str | None:
     """Canonicalize an entry address to lowercase, 0x-free, zero-padded hex ("000b32a0").
 
@@ -79,7 +111,9 @@ def build_evidence_ref(
     """The neutral, re-scan-stable per-instance locator: ``<run>#<sha8>:<addr>@<suffix>``.
 
     ``suffix`` is the sink-class hit (``cmd`` / ``copy`` / ``cmd_via_wrapper`` …), which keeps the
-    ref unique when one function matches several sinks. Each anchor degrades honestly, worst-anchor
+    ref unique when one function matches several sinks, and for a per-callsite shape carries the
+    callsite ordinal too (``copy#1``) so siblings within one function stay distinct — build it with
+    ``callsite_suffix`` rather than by hand. Each anchor degrades honestly, worst-anchor
     last: binary = sha256 prefix -> name -> "nobin"; function = address -> name -> "id<func_id>".
     The ``id<func_id>`` tail is the only unstable form and is unreachable on real firmware (every
     one of 88,178 functions carried an address); it exists so a degenerate row still gets a unique

@@ -22,6 +22,7 @@ import treasure_map.lib.hunt.analyzer2 as analyzer2_mod
 from treasure_map.lib.atlas.connection import open_atlas
 from treasure_map.lib.hunt import run_analyzer2
 from treasure_map.lib.query import explain_candidate, get_run
+from treasure_map.lib.query.sink_impact import PROVABLY_CONSTANT_MARKERS
 from treasure_map.lib.query.triage import _CONTROLLABILITY_RANK, _controllability_rank
 from treasure_map.lib.storage.connection import open_db
 
@@ -1333,6 +1334,43 @@ def test_evidence_ref_survives_a_rescan(tmp_path: Path) -> None:
     assert f"fn{id_before}" not in ref_before  # never the rowid
 
 
+def test_copy_callsite_refs_survive_a_rescan(tmp_path: Path) -> None:
+    """A callsite ref has to survive a re-scan too, or the split costs what refs are FOR.
+
+    The ordinal is read off the decompiled text, which is a weaker anchor than the entry address —
+    so the property the durable judgement store depends on gets its own check rather than riding on
+    the address test above. Same firmware, re-ingested (every func_id moves): the three copy refs
+    come back identical, ordinals and all.
+
+    Both drift mechanisms the address anchor is tested against are replayed here, because an
+    ordinal taken from ingest would survive the first and not the second: a plain re-ingest (every
+    func_id climbs past the old high-water mark) and one that also flips the enumeration order,
+    which is what changing the extractor does.
+
+    MUTATION (must go RED): number the copy candidates as they are emitted — a per-run counter, or
+    a position in the match list — instead of by their place in the function's own body."""
+    fw: list[dict[str, object]] = [
+        {"name": "httpd", "funcs": [_multi_copy_fn(), _pointer_copy_fn()]}
+    ]
+    db = _make_db(tmp_path, fw)
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_1")
+    before = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ResponseSetup")]
+    id_before = _func_id_of(db, "ResponseSetup")
+
+    _rescan_funcs(db, fw)  # same firmware, same order — only the ingest bookkeeping moves
+    run_analyzer2(db, atlas, source_run_id="run_1")
+    assert _func_id_of(db, "ResponseSetup") != id_before, "fixture did not reproduce id drift"
+    assert [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ResponseSetup")] == before
+
+    _rescan_funcs(db, fw, reverse=True)  # enumeration order flipped too
+    run_analyzer2(db, atlas, source_run_id="run_1")
+    after = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ResponseSetup")]
+
+    assert after == before
+    assert [r.rsplit("@", 1)[1] for r in after] == ["copy#0", "copy#1", "copy#2"]
+
+
 def test_evidence_ref_survives_enumeration_order_change(tmp_path: Path) -> None:
     # Adding/removing a detector can reorder the extractor's function enumeration. That reorders the
     # AUTOINCREMENT ids; the ref must not care (spec acceptance 2).
@@ -1647,8 +1685,12 @@ def test_multi_sink_function_has_unique_evidence_refs(tmp_path: Path) -> None:
     assert len(rows) >= 2  # one function, multiple sink hits -> multiple instances
     refs = [r["evidence_ref"] for r in rows]
     assert len(set(refs)) == len(refs), f"evidence_ref collided across sink hits: {refs}"
-    sink_classes = {r["evidence_ref"].split("@", 1)[1] for r in rows}
-    assert {"cmd", "copy"} <= sink_classes  # the ref carries the distinguishing sink class
+    suffixes = {str(r["evidence_ref"]).split("@", 1)[1] for r in rows}
+    # The ref carries the distinguishing sink class, and — for a shape emitted per CALLSITE —
+    # the callsite ordinal after it (``copy#0``). Compared on the class part, because which of
+    # the two forms a class uses is that shape's business, not this test's.
+    assert {s.split("#", 1)[0] for s in suffixes} >= {"cmd", "copy"}
+    assert "copy#0" in suffixes  # the copy hit names its callsite
 
 
 def test_explain_anchors_the_right_sink_hit(tmp_path: Path) -> None:
@@ -3198,3 +3240,237 @@ def test_cmd_axis_keeps_its_form_note(tmp_path: Path) -> None:
         tmp_path, [_thin_cmd_wrapper_fn(), _const_via_wrapper_fn()], run="run_cmd_note"
     )
     assert _by_anchor(atlas)["reboot_now"]["blocking_mechanism"] == "const_sink_arg"
+
+
+# ── copy candidates are per CALLSITE, end to end ─────────────────────────────────────
+
+
+def _multi_copy_fn(name: str = "ResponseSetup") -> dict[str, object]:
+    """A handler that copies a fixed 4 bytes, then two caller-supplied lengths into stack buffers.
+
+    The shape this whole change is about, in the form it was found in: the bounded copy comes
+    FIRST, so the one row the function used to produce reported a constant length — and a constant
+    length is a marker that sinks a candidate out of the first screen. Both unbounded copies below
+    it were represented by it, and demoted with it."""
+    return {
+        "name": name,
+        "address": "0x527998",
+        "hash": f"h_{name}",
+        "pseudocode": (
+            f"void {name}(int param_1, char *param_2) {{\n"
+            "  char acStack_164[64];\n"
+            "  char acStack_100[128];\n"
+            "  uint uVar1;\n"
+            "  uint uVar2;\n"
+            "  memcpy(&local_port, param_2, 4);\n"
+            "  memcpy(acStack_164, param_2 + 4, uVar1);\n"
+            "  memcpy(acStack_100, param_2 + 8, uVar2);\n"
+            "}"
+        ),
+        "callees": ["memcpy"],
+    }
+
+
+def _pointer_copy_fn(name: str = "elem_copy") -> dict[str, object]:
+    """A function whose copy callee is taken by ADDRESS and called through the pointer.
+
+    The callee list names memcpy; the decompiled body never writes ``memcpy(``. Real, and not rare:
+    49 of 1380 copy-carrying functions on one firmware. Kept as a fixture because the per-callsite
+    detector has to still emit for it."""
+    return {
+        "name": name,
+        "address": "0x401200",
+        "hash": f"h_{name}",
+        "pseudocode": (
+            f"void {name}(int param_1, int param_2) {{\n"
+            "  code *pcVar1;\n"
+            "  pcVar1 = memcpy;\n"
+            "  (*pcVar1)(param_1, param_2, 0x40);\n"
+            "}"
+        ),
+        "callees": ["memcpy"],
+    }
+
+
+def _copy_rows(atlas_path: Path, anchor: str) -> list[sqlite3.Row]:
+    conn = open_atlas(atlas_path)
+    try:
+        return conn.execute(
+            "SELECT i.* FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
+            "WHERE p.sink_class = 'copy' AND i.source_anchor = ? ORDER BY i.evidence_ref",
+            (anchor,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_a_copy_the_safe_one_stood_in_for_becomes_its_own_candidate(tmp_path: Path) -> None:
+    """★ THE property. Three copies, three candidates, each graded on its OWN length.
+
+    Before this, the function produced one candidate: length ``const`` (the first copy's fixed 4),
+    controllability ``constant``, and the demotion for a proven-constant value sank it. The two
+    stack copies with caller-supplied lengths had no row of their own — the safest copy in the
+    function was the only one anyone could find, and it was filed under "shown safe".
+
+    The two unbounded ones carry NO blocking mechanism, which is what keeps them out of the
+    demotion: an unproven length is not a bounded one, and only proven-safe facts may sink a
+    candidate.
+
+    MUTATION (must go RED): grade every copy on the first call (drop ``copy_occurrence``) — all
+    three come back ``const_size`` and all three sink."""
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_multi_copy_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_copy")
+
+    rows = _copy_rows(atlas, "ResponseSetup")
+    assert len(rows) == 3
+    assert [r["blocking_mechanism"] for r in rows] == ["const_size", None, None]
+    assert {r["reachability_status"] for r in rows} == {"unknown"}
+    # only the proven-constant one is demotable; a '?' is never sunk
+    assert [r["blocking_mechanism"] in PROVABLY_CONSTANT_MARKERS for r in rows] == [
+        True,
+        False,
+        False,
+    ]
+
+    # ...and that is what the reader sees: the fixed-length call reads proven-constant and takes
+    # the demotion, the two unproven ones read '?' and rank ahead of it under the default lens.
+    from treasure_map.lib.query import triage as run_triage
+    from treasure_map.lib.query.triage import _is_proven_safe
+
+    conn = open_atlas(atlas)
+    try:
+        order = [c.evidence_ref for c in run_triage(conn)]
+        by_ref = {c.evidence_ref: c for c in run_triage(conn)}
+    finally:
+        conn.close()
+    refs = [str(r["evidence_ref"]) for r in rows]
+    assert [by_ref[r].dim("controllability").state for r in refs] == [
+        "proven",
+        "unknown",
+        "unknown",
+    ]
+    assert [_is_proven_safe(by_ref[r]) for r in refs] == [True, False, False]
+    assert order.index(refs[0]) > max(order.index(refs[1]), order.index(refs[2]))
+
+
+def test_sibling_copy_candidates_get_distinct_refs_that_each_resolve(tmp_path: Path) -> None:
+    """INV-5. Siblings need distinct refs or the extra rows are written and never readable.
+
+    Every ref reader resolves ``WHERE evidence_ref = ? ORDER BY instance_id LIMIT 1``, so three
+    rows under one ref are not three candidates — two of them silently do not exist, which is the
+    same disappearance the split exists to undo. The callsite ordinal is what keeps them apart, and
+    each ref has to survive a round trip through the reader that an agent actually calls.
+
+    MUTATION (must go RED): mint the ref from the bare sink class again — the refs collide and
+    explain_candidate returns the same row three times."""
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_multi_copy_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_copy")
+
+    refs = [str(r["evidence_ref"]) for r in _copy_rows(atlas, "ResponseSetup")]
+    assert len(set(refs)) == 3
+    assert [r.rsplit("@", 1)[1] for r in refs] == ["copy#0", "copy#1", "copy#2"]
+
+    conn = open_atlas(atlas)
+    try:
+        explained = [explain_candidate(conn, ref) for ref in refs]
+    finally:
+        conn.close()
+    assert all(ex is not None for ex in explained)
+    assert [ex.candidate.evidence_ref for ex in explained] == refs  # type: ignore[union-attr]
+
+
+def test_each_copy_candidate_says_which_call_it_is_about(tmp_path: Path) -> None:
+    """A row that cannot say which call it describes hands the reader two facts and a guess.
+
+    Same function, same callee, different length: without the callsite the three rows differ only
+    in a ref suffix. The length picture names the call it read, so the ordinals and the length
+    travel together.
+
+    MUTATION (must go RED): stop recording ``copy_callsite``, or record it for the sink class
+    rather than the call (all three then read ``occurrence: 0``)."""
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_multi_copy_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_copy")
+
+    seen = []
+    for row in _copy_rows(atlas, "ResponseSetup"):
+        ev = json.loads(str(row["flow_evidence"]))
+        seen.append((ev["copy_callsite"], ev["size_kind"], ev["size_flow"]["size_var"]))
+    assert [c["index"] for c, _k, _v in seen] == [0, 1, 2]
+    assert [c["occurrence"] for c, _k, _v in seen] == [0, 1, 2]
+    assert {c["sink"] for c, _k, _v in seen} == {"memcpy"}
+    assert {c["anchor"] for c, _k, _v in seen} == {"callsite"}
+    assert [k for _c, k, _v in seen] == ["const", "variable", "variable"]
+    assert [v for _c, _k, v in seen] == [None, "uVar1", "uVar2"]
+
+    # ...and it reaches the reader an agent actually calls, not just the stored row.
+    conn = open_atlas(atlas)
+    try:
+        surfaced = [
+            explain_candidate(conn, str(r["evidence_ref"])).evidence_surface  # type: ignore[union-attr]
+            for r in _copy_rows(atlas, "ResponseSetup")
+        ]
+    finally:
+        conn.close()
+    assert [s["callsite"]["index"] for s in surfaced] == [0, 1, 2]  # type: ignore[index]
+    assert [s["size_kind"] for s in surfaced] == ["const", "variable", "variable"]  # type: ignore[index]
+
+
+def test_a_copy_with_no_locatable_call_keeps_its_function_level_ref(tmp_path: Path) -> None:
+    """The recall floor, end to end: still one candidate, and its ref does not claim a callsite.
+
+    A candidate whose call could not be found in the text is the function-level match it has always
+    been, and its ref is the one it has always had — byte for byte, so nothing anchored to it moves.
+    Writing ``copy#0`` here would be the cheaper uniform rule and the dishonest one: it would read
+    as "the first call" for a call nobody located.
+
+    MUTATION (must go RED): give the fallback an ordinal, or drop the fallback candidate."""
+    db = _make_db(tmp_path, [{"name": "libsnd.so", "funcs": [_pointer_copy_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_ptr")
+
+    rows = _copy_rows(atlas, "elem_copy")
+    assert len(rows) == 1
+    assert str(rows[0]["evidence_ref"]).endswith("@copy")
+    ev = json.loads(str(rows[0]["flow_evidence"]))
+    assert ev["copy_callsite"] == {
+        "sink": "memcpy",
+        "index": None,
+        "occurrence": None,
+        "anchor": "function",
+    }
+    assert ev["size_kind"] == "untraced"  # honestly unread, never a bounded-looking kind
+
+
+def test_per_callsite_copies_do_not_move_the_recurrence_ledgers(tmp_path: Path) -> None:
+    """INV-6. More candidates, same ledgers — so nothing downstream needs re-baselining.
+
+    ``pattern_breadth`` counts distinct pseudocode hashes and ``device_spread`` distinct runs; both
+    keys are per function / per run, and the siblings share one pattern row because the fingerprint
+    is over the shape. The instance count DOES rise, which is the honest part: there really are
+    three candidates now.
+
+    MUTATION (must go RED): put the callsite ordinal in the fingerprint basis — the siblings split
+    into three patterns and pattern_breadth is computed over three rows instead of one."""
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_multi_copy_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_copy")
+
+    conn = open_atlas(atlas)
+    try:
+        # every column qualified: `pattern` carries its own write-side device_spread counter, so
+        # a bare name here is ambiguous and the read-side view is the one being asserted about
+        ledger = conn.execute(
+            "SELECT l.pattern_id, l.device_spread, l.pattern_breadth FROM pattern_ledger l "
+            "WHERE l.sink_class = 'copy'"
+        ).fetchall()
+        density = conn.execute(
+            "SELECT instance_count FROM density_candidate WHERE sink_class = 'copy'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(ledger) == 1  # one shape, one pattern row
+    assert [(r["device_spread"], r["pattern_breadth"]) for r in ledger] == [(1, 1)]
+    assert [r["instance_count"] for r in density] == [3]  # the candidate count is what grew

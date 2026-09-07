@@ -99,12 +99,15 @@ def scan(db_path: Path | str) -> ScanResult:
 
         func_ref = FuncRef(binary_name=binary_name, func_name=row["name"], func_id=row["id"])
         pseudocode = row["pseudocode"] or ""
+        # A detector returns a LIST: empty when its shape is absent, one entry for a
+        # function-level shape, and one per CALLSITE for a shape whose facts belong to the call
+        # (copy). The three function counters above stay OUTSIDE this loop and are incremented
+        # once per function — a function that yields six candidates is still one function scanned,
+        # so the partition Gate D checks is unaffected by how many candidates come out of it.
         for detector in DETECTORS:
-            match = detector(func_ref, callees, pseudocode)
-            if match is None:
-                continue
-            matches.append(match)
-            hits[match.pattern_kind] += 1
+            for match in detector(func_ref, callees, pseudocode):
+                matches.append(match)
+                hits[match.pattern_kind] += 1
 
     stats = PatternStats(
         functions_scanned=functions_scanned,

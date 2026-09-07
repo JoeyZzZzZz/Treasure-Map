@@ -134,3 +134,48 @@ def test_absent_call_is_untraced() -> None:
 
 def test_non_copy_sink_is_untraced() -> None:
     assert classify_copy_size("system(cmd);", "system").kind == SIZE_UNTRACED
+
+
+# ── which CALL is classified ─────────────────────────────────────────────────────────
+
+
+def test_each_call_is_classified_on_its_own_length() -> None:
+    """INV-2. The length belongs to the CALL, so ``occurrence`` selects which call is read.
+
+    The first copy below is a fixed 4 bytes and the second a caller-supplied length. Reading only
+    the first reports ``const`` for both — and ``const`` is a marker that sinks a candidate out of
+    the first screen, so the second call would be demoted on the first call's evidence.
+
+    MUTATION (must go RED): ignore ``occurrence`` and read the first call again."""
+    pseudo = "memcpy(dst, src, 4); memcpy(other, src, len);"
+    assert classify_copy_size(pseudo, "memcpy").kind == SIZE_CONST  # default: the first call
+    assert classify_copy_size(pseudo, "memcpy", occurrence=0).kind == SIZE_CONST
+    second = classify_copy_size(pseudo, "memcpy", occurrence=1)
+    assert second.kind == SIZE_VARIABLE
+    assert second.size_var == "len"
+    assert copy_size_form_note(second.kind) is None  # not proven bounded -> not demoted
+
+
+def test_occurrence_past_the_last_call_is_untraced() -> None:
+    """An occurrence that is not there is ``untraced`` — the absence of a fact, not a safe length.
+
+    It is unreachable through the detector (which counts the calls it emits for), so this pins the
+    behaviour for every other caller: the failure direction has to be the one that keeps a
+    candidate at its normal rank, never a bounded-looking kind that would demote it.
+
+    MUTATION (must go RED): clamp the occurrence into range (read the last call, or the first)."""
+    pseudo = "memcpy(dst, src, 4);"
+    assert classify_copy_size(pseudo, "memcpy", occurrence=1).kind == SIZE_UNTRACED
+    assert classify_copy_size(pseudo, "memcpy", occurrence=-1).kind == SIZE_UNTRACED
+
+
+def test_occurrence_counts_calls_to_its_own_callee() -> None:
+    """``occurrence`` is an ordinal within ONE callee, not a position among all copy calls.
+
+    The detector carries both numbers for this reason: here the second memcpy is the THIRD copy
+    call in the function, and indexing by the position-among-all would read past the end.
+
+    MUTATION (must go RED): count occurrences across callee names."""
+    pseudo = "memcpy(a, b, 4); strcpy(x, y); memcpy(c, d, n);"
+    assert classify_copy_size(pseudo, "memcpy", occurrence=1).size_var == "n"
+    assert classify_copy_size(pseudo, "strcpy", occurrence=0).kind == SIZE_SOURCE_LEN

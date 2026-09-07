@@ -288,7 +288,12 @@ def _size_trace_boundary(
 
 
 def build_size_evidence(
-    *, pseudocode: str, sink_name: str, entry_sites: list[dict[str, Any]] | None = None
+    *,
+    pseudocode: str,
+    sink_name: str,
+    entry_sites: list[dict[str, Any]] | None = None,
+    callsite_index: int | None = None,
+    occurrence: int = 0,
 ) -> dict[str, Any]:
     """Assemble the size-flow evidence for one copy-sink candidate (JSON-serializable).
 
@@ -300,16 +305,31 @@ def build_size_evidence(
 
     ``entry_reach`` carries the same rootfs-invocation evidence as the command-sink path so a copy
     candidate ranks evenly with cmd/fmt on entry reachability (None/[] is reported ``unknown``,
-    NEVER "unreachable")."""
-    cs = classify_copy_size(pseudocode, sink_name)
+    NEVER "unreachable").
+
+    ``callsite_index`` / ``occurrence`` say WHICH copy call this is, and the length is read from
+    that call. The record names it back in ``copy_callsite`` because sibling candidates from one
+    function are otherwise indistinguishable on screen — same function, same callee, different
+    length — and a reader with no way to tell them apart is being handed two facts and told to
+    guess which call each belongs to. ``callsite_index=None`` means the call could not be located
+    in the text at all: the record then says ``anchor: "function"`` and leaves the ordinals null,
+    rather than printing a 0 that would read as "the first call" for a call nobody found."""
+    cs = classify_copy_size(pseudocode, sink_name, occurrence=occurrence)
     deps = _derives_map(pseudocode)
     if cs.size_var is not None:
         real = _real_vars(pseudocode, deps)
         one_hop = sorted(v for v in deps.get(cs.size_var, set()) if v in real)
     else:
         one_hop = []
+    anchored = callsite_index is not None
     return {
         "size_kind": cs.kind,
+        "copy_callsite": {
+            "sink": sink_name,
+            "index": callsite_index,
+            "occurrence": occurrence if anchored else None,
+            "anchor": "callsite" if anchored else "function",
+        },
         "size_flow": {"size_arg": cs.size_text, "size_var": cs.size_var, "one_hop": one_hop},
         "clamp_seen": [{"shape": s, "coverage": "unjudged"} for s in cs.clamps],
         "entry_reach": {

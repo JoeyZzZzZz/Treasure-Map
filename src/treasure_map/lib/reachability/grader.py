@@ -131,6 +131,7 @@ def grade_candidate(
     sink_name: str,
     *,
     source_class: str | None = None,
+    copy_occurrence: int = 0,
 ) -> ReachabilityVerdict:
     """Grade one candidate as confirmed / unknown (``blocked`` is reserved, never emitted here).
 
@@ -138,6 +139,11 @@ def grade_candidate(
     module docstring — deciding non-reachability soundly is left to the deep engine, so "blocked"
     stays a valid but unused ReachabilityStatus). source_class is accepted for interface symmetry
     with the detection layer; the grade is decided from the pseudocode, callees, and sink alone.
+
+    ``copy_occurrence`` selects WHICH call to ``sink_name`` the copy branch reads (0-based, default
+    the first — the historical reading). It is meaningful only there: a copy candidate is about one
+    call, so grading its length has to be about that call too. Every other sink is graded on the
+    function as before and ignores it.
     """
     if not callees:
         return ReachabilityVerdict("unknown", None, _BASIS_NO_CALLEES, degraded=True)
@@ -149,7 +155,7 @@ def grade_candidate(
         # function. classify_copy_size reads the length source; a provably-bounded length
         # (const/sizeof/clamp/pointer_guard) carries a downweight form note, a suspect or
         # unbounded length carries none (kept at its normal rank — never silently demoted).
-        cs = classify_copy_size(pseudocode, sink_name)
+        cs = classify_copy_size(pseudocode, sink_name, occurrence=copy_occurrence)
         basis = _COPY_BASIS.get(cs.kind, _BASIS_ORIGIN_UNKNOWN)
         return ReachabilityVerdict("unknown", copy_size_form_note(cs.kind), basis)
 

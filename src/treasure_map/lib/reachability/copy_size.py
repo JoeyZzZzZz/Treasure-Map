@@ -34,6 +34,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from treasure_map.lib.pattern.classes import call_offsets
 from treasure_map.lib.reachability.taint import _IDENT_RE
 
 # Size-source kinds (mechanism labels, not verdicts).
@@ -132,19 +133,29 @@ def _split_top(arglist: str) -> list[str]:
     return parts
 
 
-def _first_call_args(pseudocode: str, name: str) -> list[str] | None:
-    """Top-level arguments of the FIRST call to ``name``, or None when not located."""
-    for m in re.finditer(rf"\b{re.escape(name)}\s*\(", pseudocode):
-        i = m.end() - 1  # at the '('
-        depth = 0
-        for j in range(i, len(pseudocode)):
-            ch = pseudocode[j]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    return _split_top(pseudocode[i + 1 : j])
+def _call_args(pseudocode: str, name: str, occurrence: int) -> list[str] | None:
+    """Top-level arguments of the ``occurrence``-th call to ``name`` (0-based), or None.
+
+    The call positions come from ``classes.call_offsets`` — the same authority the detector counts
+    callsites with. That is what makes "candidate for the 2nd memcpy" and "the arguments of the 2nd
+    memcpy" the same call: a second regex here would agree with the first only until one of them
+    was adjusted, and then a candidate would silently carry another call's length.
+
+    None when the call is not there — an occurrence past the end, or a callee the body never spells
+    out. The caller reports that as ``untraced``, never as an absence of length."""
+    offsets = call_offsets(pseudocode, name)
+    if occurrence < 0 or occurrence >= len(offsets):
+        return None
+    i = offsets[occurrence]  # at the '('
+    depth = 0
+    for j in range(i, len(pseudocode)):
+        ch = pseudocode[j]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return _split_top(pseudocode[i + 1 : j])
     return None
 
 
@@ -186,11 +197,23 @@ def _pointer_guards(pseudocode: str, var: str) -> tuple[str, ...]:
     return tuple(label for pat, label in shapes if re.search(pat, pseudocode))
 
 
-def classify_copy_size(pseudocode: str, sink_name: str) -> CopySize:
-    """Classify the size source of the first ``sink_name`` copy call in ``pseudocode``.
+def classify_copy_size(pseudocode: str, sink_name: str, *, occurrence: int = 0) -> CopySize:
+    """Classify the size source of the ``occurrence``-th ``sink_name`` copy call in ``pseudocode``.
 
-    Returns a CopySize. An unreadable call or a non-copy ``sink_name`` yields ``untraced``."""
-    args = _first_call_args(pseudocode, sink_name)
+    ``occurrence`` is 0-based and defaults to the first call — the historical reading, kept as the
+    default so a caller with no callsite in hand behaves exactly as before. It is a property of the
+    CALL, which is why it has to be selectable: a function that copies a literal 4 bytes and then a
+    caller-supplied length holds both facts, and reading only the first reports the safe one for
+    both.
+
+    The clamp/guard search around the length variable stays whole-function on purpose. It is
+    already a presence-only signal that never claims to dominate the copy (see ``_clamps_for``);
+    narrowing it to a text window would not turn it into a dominance proof, and would drop real
+    guards written before the loop the copy sits in.
+
+    Returns a CopySize. An unreadable call, an occurrence that is not there, or a non-copy
+    ``sink_name`` yields ``untraced``."""
+    args = _call_args(pseudocode, sink_name, occurrence)
     if args is None:
         return CopySize(SIZE_UNTRACED, None, None)
 
