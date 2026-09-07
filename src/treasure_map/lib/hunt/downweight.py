@@ -1,13 +1,16 @@
 # Copyright (C) 2026 JoeyZzZzZz
 # SPDX-License-Identifier: Apache-2.0
-"""Recognize already-low-yield candidate forms and the third-party-library origin.
+"""Recognize already-low-yield candidate forms.
 
 These are FP-suppression signals, not verdicts: each names a neutral structural form known
 (from manual review) to rarely carry a live issue, so review-ordering can rank it low. A
-recognized form is recorded in the instance's existing neutral fields — `blocking_mechanism`
-(a categorical form note) or `origin` (`stock_oss_known`) — and the read-side score table
-lowers it. Nothing here removes a candidate or grades reachability; under doubt it stays silent
-(no form note), so a real candidate is never hidden.
+recognized form is recorded in the instance's existing `blocking_mechanism` field (a categorical
+form note) and the read-side score table lowers it. Nothing here removes a candidate or grades
+reachability; under doubt it stays silent (no form note), so a real candidate is never hidden.
+
+★ This module no longer answers where a function's CODE came from. It used to, by reading the
+symbol name, and that guess has been retired — see the note where it lived, below the charset
+set. `origin` is written 'unknown' by the hunt now.
 
 ★ Parameter-specific by construction. A form downweight fires ONLY when the sink's dangerous
 argument truly comes only from the recognized safe/constant source. If any free value — an
@@ -90,32 +93,22 @@ _CHARSET_SAFE: frozenset[str] = frozenset(
     }
 )
 
-# Strongly namespaced public third-party C/C++ library symbols (NOT vendor symbols). A match
-# means stock OSS even when statically linked into a custom-named binary — which the
-# binary-granularity OSS exclusion cannot see.
-_THIRD_PARTY_SYMBOL_RE = re.compile(
-    r"(?:"
-    r"^_ZN6apache|^_ZN6thrift|^apache::|^thrift::"  # apache thrift (mangled / demangled)
-    r"|^mbedtls_|^mbedtls::"  # mbed TLS
-    r"|^SSL_|^EVP_|^BIO_|^X509_|^RSA_|^EC_|^CRYPTO_|^OPENSSL_"  # openssl
-    r"|^json_object_|^json_tokener_|^json_c_"  # json-c
-    r"|^cJSON_"  # cJSON
-    r"|^curl_|^Curl_"  # curl
-    r"|^xmlParse|^xmlNode|^xmlDoc|^xmlFree"  # libxml2
-    r"|^_ZN5boost|^boost::"  # boost (mangled / demangled)
-    r")"
-)
-
-
-def library_origin(func_name: str | None) -> str | None:
-    """Return 'stock_oss_known' if the symbol names a known public library, else None.
-
-    Conservative: only strongly namespaced symbols match. Never returns 'custom' — an
-    unrecognized symbol stays 'unknown' upstream (a false 'custom' would wrongly inflate the
-    custom/unknown breadth count; a false 'stock' is recoverable on review)."""
-    if not func_name:
-        return None
-    return "stock_oss_known" if _THIRD_PARTY_SYMBOL_RE.search(func_name) else None
+# ★ RETIRED: ``library_origin`` / ``_THIRD_PARTY_SYMBOL_RE`` — reading a symbol NAME to decide
+# "this function belongs to a third-party library". It was a guess, and the same guess the
+# by-name binary exclusion was retired for: it rests on symbols being named the way the upstream
+# project names them, which a stripped firmware does not promise and a vendor is free to break by
+# calling its own function ``SSL_xxx``.
+#
+# It was also weak where it was not wrong. It matched eight libraries' EXPORTED API prefixes, so a
+# library's internal functions — most of its code — were already 'unknown' and already counted
+# everywhere the label was meant to keep them out of. On the real atlas it labelled 558 of 28,383
+# instances (2.0%); the other 98% of the same libraries went through unlabelled. It never
+# separated stock code from custom code, it skimmed the exported layer off the top.
+#
+# Nothing replaces it here. ``origin`` is written 'unknown' at both hunt call sites, which is the
+# conservative direction (nothing is now guessed to be library code and therefore less worth
+# looking at). The four-value column and its CHECK stay — see atlas_schema.sql — for a
+# determinate classifier that reads content rather than names.
 
 
 def _cmd_callees(callees: list[str]) -> set[str]:

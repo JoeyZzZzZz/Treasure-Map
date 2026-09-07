@@ -47,8 +47,13 @@ class LedgerRow:
                       in (custom, unknown); a provisional upper bound under
                       fine_fp_algo_version (included origins = custom, unknown).
 
-    ★ the bound loosened materially when scan-time exclusion was retired: instances from
-    widely-shipped stock binaries count here until origin is component-confirmed.
+    ★ The bound is loose, and it is loose in a stated direction: instances from widely-shipped
+    stock binaries count here. That began when the scan-time exclusion by binary name was retired,
+    and it is now total — the symbol-name guess that labelled a fraction of them 'stock_oss_known'
+    has been retired as well, so a freshly hunted run writes 'unknown' for everything and the
+    origin clause excludes none of it. Read the number as "distinct bodies matching this shape",
+    not as "distinct bodies someone wrote for this device". Narrowing it needs a classifier that
+    decides from CONTENT; there is none, and the previous one decided from names.
     """
 
     pattern_id: int
@@ -105,7 +110,8 @@ def ledger(conn: sqlite3.Connection) -> list[LedgerRow]:
 
     pattern_breadth = distinct fine fingerprints (pseudocode_hash) over origin in
     (custom, unknown); a provisional upper bound under FINE_FP_ALGO_VERSION (included origins
-    = custom, unknown). device_spread = distinct source_run_id (exposure).
+    = custom, unknown) — which, since the symbol-name origin guess was retired, is every instance
+    a current run writes. device_spread = distinct source_run_id (exposure).
     """
     rows = conn.execute(
         "SELECT pattern_id, sink_class, structural_fingerprint, device_spread, pattern_breadth "

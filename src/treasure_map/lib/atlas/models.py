@@ -49,8 +49,10 @@ class InstanceRow:
     # lives in. Auto-filled from the source build; both REDACT ON EXPORT (private evidence).
     binary_path: str | None = None
     binary_content_hash: str | None = None
-    # Neutral origin dimension; not forced at ingest — defaults to 'unknown' (refined later
-    # at the aggregation layer). One of custom/vendor_modified_oss/stock_oss_known/unknown.
+    # Where this instance's code came from. One of custom/vendor_modified_oss/stock_oss_known/
+    # unknown — and 'unknown' is the only one the hunt writes: the guess that read a symbol name
+    # to answer this was retired (see lib/hunt/downweight.py). The other three are a slot held
+    # for a classifier that decides from content, not a state the pipeline reaches today.
     origin: str = "unknown"
     # Neutral structural fact: the function is a thin wrapper forwarding a parameter to a shell
     # command sink, and which sink (system/popen/doSystem). Recorded for a later analysis layer;

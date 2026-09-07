@@ -52,7 +52,11 @@ CREATE TABLE IF NOT EXISTS instance (
     --   downstream agent — NOT a verdict; no recall/score/grade path reads it. May hold neutral
     --   rootfs paths as private evidence. REDACT ON EXPORT.
     flow_evidence       TEXT,
-    -- origin is not forced at ingest; default unknown is expected (refined later at aggregation)
+    -- Where this instance's CODE came from. NOTHING WRITES ANYTHING BUT 'unknown' TODAY: the
+    --   hunt used to guess 'stock_oss_known' from a function's symbol name and that guess was
+    --   retired (see lib/hunt/downweight.py), so the other three values are a slot held open
+    --   for a classifier that reads content rather than names, not a state the pipeline
+    --   currently reaches. The four-value CHECK stays for that reason.
     origin              TEXT NOT NULL DEFAULT 'unknown'
         CHECK (origin IN ('custom','vendor_modified_oss','stock_oss_known','unknown')),
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -143,6 +147,13 @@ CREATE VIEW IF NOT EXISTS twin_candidate AS
 --   pattern_breadth = COUNT(DISTINCT pseudocode_hash) over the pattern's instances with
 --                     origin IN ('custom','unknown') and pseudocode_hash IS NOT NULL — the count
 --                     of distinct fine fingerprints (M2 fine fingerprint = pseudocode_hash).
+--                     ★ The origin clause currently excludes NOTHING from a freshly hunted run:
+--                     every instance is written 'unknown' since the symbol-name guess was
+--                     retired, so the count is over all of them. It is kept, not simplified
+--                     away, because it is where a content-based classifier would attach — and
+--                     because a predicate that reads as a filter should not silently become an
+--                     absence of one. Rows written before the retirement keep their old label
+--                     and stay excluded until their run is hunted again.
 -- The stored pattern.device_spread column is a write-side convenience counter with the same
 -- definition; this view's device_spread is the read-side authority and should agree with it.
 CREATE VIEW IF NOT EXISTS pattern_ledger AS

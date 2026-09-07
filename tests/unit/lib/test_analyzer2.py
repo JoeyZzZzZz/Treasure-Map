@@ -1851,10 +1851,21 @@ def test_numeric_sanitized_is_labelled_and_downweighted(tmp_path: Path) -> None:
     assert not _is_safe(atlas, "num_sys")
 
 
-def test_library_symbol_routes_to_stock_origin(tmp_path: Path) -> None:
-    # A statically-linked library function (custom-named binary, library symbol) -> stock_oss_known,
-    # which the binary-level OSS exclusion misses. It is routed off pattern_breadth (origin no
-    # longer affects the map order; the routing is what still matters for cross-firmware breadth).
+def test_a_library_looking_symbol_is_no_longer_guessed_to_be_library_code(
+    tmp_path: Path,
+) -> None:
+    """MC-2. The hunt writes ``origin='unknown'`` for everything, including the bait.
+
+    ``SSL_read`` is the fixture on purpose: it is exactly what the retired guess matched, so this
+    test would have failed before the retirement and it fails again the moment anything re-reads a
+    symbol name to answer this question. A test using only ordinary names would pass either way.
+
+    The guess is gone because it was a guess — it holds only while symbols carry their upstream
+    names, which a stripped firmware does not promise and a vendor can break by naming its own
+    function ``SSL_xxx``. 'unknown' is the conservative answer: nothing is now assumed to be
+    library code and therefore less worth looking at.
+
+    MUTATION (must go RED): restore either write site to read the function name."""
     lib_fn = _cmd_injection_fn("handle")
     lib_fn["name"] = "SSL_read"
     db = _make_db(
@@ -1865,19 +1876,77 @@ def test_library_symbol_routes_to_stock_origin(tmp_path: Path) -> None:
     run_analyzer2(db, atlas, source_run_id="run_a")
 
     rows = _by_anchor(atlas)
-    assert rows["SSL_read"]["origin"] == "stock_oss_known"
-    assert rows["real_handle"]["origin"] == "unknown"  # never defaulted to custom
-    # origin is no longer a ranking dimension (the map layers are controllability / reachability /
-    # sink_impact / ..., not code provenance); stock routing still drives pattern_breadth below
-    # (it counts only custom/unknown).
+    assert rows["SSL_read"]["origin"] == "unknown"
+    assert rows["real_handle"]["origin"] == "unknown"
+
     conn = open_atlas(atlas)
     try:
-        breadth = conn.execute(
-            "SELECT pattern_breadth FROM pattern_ledger ORDER BY pattern_id"
+        origins = {r[0] for r in conn.execute("SELECT DISTINCT origin FROM instance")}
+        breadth = conn.execute("SELECT pattern_breadth FROM pattern_ledger").fetchall()
+    finally:
+        conn.close()
+    assert origins == {"unknown"}  # the whole run, not just the two anchors above
+    assert all(r[0] >= 0 for r in breadth)  # the ledger still computes over them
+
+
+def test_a_wrapper_recovered_candidate_is_not_guessed_either(tmp_path: Path) -> None:
+    """The same retirement, at the OTHER write site — recall through a thin wrapper.
+
+    A candidate recovered through wrapper propagation is written by its own ``add_instance`` call
+    with its own ``origin=``, so a retirement that only reached the direct-candidate path would
+    leave this one still reading a symbol name. Its caller is named ``SSL_read`` here for the same
+    reason the direct test's function is: it is what the retired guess matched.
+
+    MUTATION (must go RED): restore the guess at the wrapper site only — the direct test stays
+    green and this one catches it."""
+    caller = _free_via_wrapper_fn("set_route")
+    caller["name"] = "SSL_read"
+    caller["pseudocode"] = str(caller["pseudocode"]).replace("set_route", "SSL_read")
+    db = _make_db(tmp_path, [{"name": "netd", "funcs": [_thin_cmd_wrapper_fn(), caller]}])
+    atlas = tmp_path / "atlas.db"
+    stats = run_analyzer2(db, atlas, source_run_id="run_w")
+
+    assert stats.wrapper_propagated == 1  # the wrapper path really ran (not a vacuous pass)
+    conn = open_atlas(atlas)
+    try:
+        rows = conn.execute(
+            "SELECT source_anchor, origin, scope_origin FROM instance ORDER BY instance_id"
         ).fetchall()
     finally:
         conn.close()
-    assert all(r[0] >= 0 for r in breadth)  # ledger still computes; stock excluded by definition
+    assert "SSL_read" in {r["source_anchor"] for r in rows}
+    assert {r["origin"] for r in rows} == {"unknown"}
+
+
+def test_the_origin_column_keeps_its_four_values_with_nothing_writing_three(
+    tmp_path: Path,
+) -> None:
+    """The column and its CHECK survive the retirement, and the reason is written down.
+
+    Removing them would be the tidier change and the wrong one: the constraint is the shape a
+    content-based classifier would write into, and dropping a CHECK is far harder to put back than
+    to leave. What must not happen is the opposite mistake — reading the surviving four values as
+    evidence that something still produces them. Nothing does, and that is asserted here rather
+    than left to be inferred from a schema that still lists them.
+
+    MUTATION (must go RED): drop a value from the CHECK, or let any writer emit one of the three."""
+    from treasure_map.lib.atlas.writer import _VALID_ORIGINS
+
+    assert set(_VALID_ORIGINS) == {"custom", "vendor_modified_oss", "stock_oss_known", "unknown"}
+    schema = _ATLAS_SCHEMA.read_text()
+    assert (
+        "CHECK (origin IN ('custom','vendor_modified_oss','stock_oss_known','unknown'))" in schema
+    )
+
+    # ...and no hunt path reaches any of the other three.
+    db = _make_db(tmp_path, [{"name": "webd", "funcs": [_cmd_injection_fn("h")]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_a")
+    conn = open_atlas(atlas)
+    try:
+        assert {r[0] for r in conn.execute("SELECT DISTINCT origin FROM instance")} == {"unknown"}
+    finally:
+        conn.close()
 
 
 def test_plain_shell_candidate_is_not_downweighted(tmp_path: Path) -> None:

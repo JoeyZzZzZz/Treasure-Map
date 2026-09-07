@@ -151,8 +151,12 @@ def test_ledger_different_hash_different_runs_breadth_two(tmp_path: Path) -> Non
 
 
 def test_ledger_stock_oss_known_leaves_breadth_keeps_spread(tmp_path: Path) -> None:
-    # An instance recognized as stock_oss_known exits pattern_breadth (origin not in
-    # custom/unknown) but stays in device_spread (exposure counts everything).
+    # A labelled instance exits pattern_breadth (origin not in custom/unknown) but stays in
+    # device_spread (exposure counts everything). The predicate is unchanged and still tested,
+    # but nothing WRITES that label any more: the symbol-name guess that produced it was retired,
+    # so rows like this one exist only in atlas data from before that, until their run is hunted
+    # again. Kept because the clause is where a content-based classifier would attach, and a
+    # predicate nobody tests is a predicate nobody notices breaking.
     conn = _atlas(tmp_path)
     p = _pattern(conn, "fp_c", "cmd")
     _inst(conn, p, status="unknown", run_id="r1", h="h1", origin="unknown")
@@ -187,4 +191,69 @@ def test_pattern_breadth_is_derived_not_stored(tmp_path: Path) -> None:
 
     pattern_cols = {r[1] for r in conn.execute("PRAGMA table_info(pattern)").fetchall()}
     assert "pattern_breadth" not in pattern_cols  # derived only, never frozen on the table
+    conn.close()
+
+
+# ── retiring an origin label: what it can and cannot do to the ledger ─────────────────
+
+
+def _breadth(conn: sqlite3.Connection, pattern_id: int) -> int:
+    return _ledger_for(conn, pattern_id).pattern_breadth
+
+
+def test_relabelling_stock_to_unknown_only_widens_breadth_and_by_a_bounded_amount(
+    tmp_path: Path,
+) -> None:
+    """MC-3. The one ledger the retirement actually moves, bounded in both directions.
+
+    Re-hunting a run after the retirement rewrites its instances' origin to 'unknown', which is
+    what this simulates. Two things have to hold and they are different claims:
+
+    * breadth can only go UP. The clause admits more rows, never fewer — if it ever went down, the
+      predicate would have started excluding something it did not before.
+    * it goes up by AT MOST the distinct fingerprints that were being excluded, per pattern. Adding
+      rows to a COUNT DISTINCT adds at most the number of distinct new values.
+
+    ★ Per PATTERN, not summed across them. The summed delta can EXCEED the globally-distinct count
+    of excluded fingerprints, because one pseudocode_hash can sit under several patterns and be
+    counted once in each — measured on the real atlas at the time of writing: +429 summed against
+    424 globally-distinct, so an aggregate bound stated that way is simply not an upper bound. The
+    per-pattern form is the one that is arithmetically true.
+
+    MUTATION (must go RED): change the origin clause to admit a different set (e.g. drop 'custom',
+    or exclude 'unknown') — the count then moves in a way neither bound allows."""
+    conn = _atlas(tmp_path)
+    p1 = _pattern(conn, "fp_a", "cmd")
+    p2 = _pattern(conn, "fp_b", "copy")
+    # p1: one unlabelled body, two labelled ones (one of which duplicates the unlabelled hash, so
+    # the bound is not trivially the row count).
+    _inst(conn, p1, status="unknown", run_id="r1", h="h1", origin="unknown")
+    _inst(conn, p1, status="unknown", run_id="r1", h="h2", origin="stock_oss_known")
+    _inst(conn, p1, status="unknown", run_id="r1", h="h1", origin="stock_oss_known")
+    # p2: labelled only — its breadth is 0 today and becomes 1.
+    _inst(conn, p2, status="unknown", run_id="r1", h="h9", origin="stock_oss_known")
+
+    before = {p1: _breadth(conn, p1), p2: _breadth(conn, p2)}
+    assert before == {p1: 1, p2: 0}
+
+    bound = {
+        pid: conn.execute(
+            "SELECT COUNT(DISTINCT pseudocode_hash) FROM instance "
+            "WHERE pattern_id = ? AND origin NOT IN ('custom','unknown') "
+            "AND pseudocode_hash IS NOT NULL",
+            (pid,),
+        ).fetchone()[0]
+        for pid in (p1, p2)
+    }
+    assert bound == {p1: 2, p2: 1}
+
+    conn.execute("UPDATE instance SET origin = 'unknown'")  # what a re-hunt now writes
+    conn.commit()
+
+    for pid in (p1, p2):
+        after = _breadth(conn, pid)
+        assert after >= before[pid], "the clause admits more rows; breadth cannot shrink"
+        assert after - before[pid] <= bound[pid], "grew by more than the excluded fingerprints"
+    assert _breadth(conn, p1) == 2  # h1 was already counted; only h2 is new
+    assert _breadth(conn, p2) == 1
     conn.close()

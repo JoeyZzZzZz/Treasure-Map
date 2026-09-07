@@ -67,7 +67,6 @@ from treasure_map.lib.diff.loader import FuncRow, load_functions
 from treasure_map.lib.hunt.downweight import (
     CONST_SINK_ARG,
     detect_form_signal,
-    library_origin,
     wrapper_propagation_form_note,
 )
 from treasure_map.lib.hunt.evidence import (
@@ -1265,11 +1264,17 @@ def run_analyzer2(
                     status, blocking = verdict.status, verdict.blocking_mechanism
 
                 # FP-suppression labels written into existing neutral fields (read-side ordering
-                # downweights them; nothing is removed or graded blocked). origin recognizes
-                # statically-linked third-party library code, at function-symbol granularity; a
-                # form note marks a known low-yield shape. Only
-                # attach a form note when the grader left blocking_mechanism open.
-                origin = library_origin(match.func_ref.func_name) or "unknown"
+                # downweights them; nothing is removed or graded blocked): a form note marks a
+                # known low-yield shape, and is only attached when the grader left
+                # blocking_mechanism open.
+                #
+                # ``origin`` is written 'unknown', unconditionally. It used to carry a guess read
+                # off the function's NAME — see the retirement note in downweight.py — which was
+                # the same reasoning the by-name binary exclusion was retired for, and which
+                # skimmed 2% of instances off the top of libraries whose other 98% went through
+                # unlabelled anyway. Saying 'unknown' is the honest answer: this pass reads a
+                # function body, and where its code originally came from is not in it.
+                origin = "unknown"
                 # detect_form_signal reads the cmd danger axis (arg0). Copy sinks are graded on the
                 # write length, and format-string sinks on their per-sink format argument, by the
                 # grader — so the cmd-axis form notes must not run for either (they would read the
@@ -1604,7 +1609,7 @@ def run_analyzer2(
                         binary_path=f.binary_path or f.binary_name,
                         binary_content_hash=f.binary_sha256,
                         scope_origin="intra",
-                        origin=library_origin(f.name) or "unknown",
+                        origin="unknown",  # see the candidate path above: never guessed here
                         flow_evidence=json.dumps(evidence, sort_keys=True),
                     ),
                     commit=False,

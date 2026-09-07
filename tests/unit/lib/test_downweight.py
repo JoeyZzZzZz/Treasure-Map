@@ -18,7 +18,6 @@ from treasure_map.lib.hunt.downweight import (
     NO_SHELL_EXEC,
     NUMERIC_SANITIZED,
     detect_form_signal,
-    library_origin,
 )
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "treasure_map"
@@ -539,26 +538,43 @@ def test_free_source_two_buffers_deep_is_not_downweighted() -> None:
     )
 
 
-# ── library / symbol recognition (function granularity) ──────────────────────────────
+# ── retired: deciding a function's origin from its symbol NAME ───────────────────────
 
 
-def test_known_library_symbols_are_stock_oss() -> None:
-    for name in (
-        "SSL_read",
-        "EVP_DecryptUpdate",
-        "mbedtls_ssl_handshake",
-        "json_object_get",
-        "curl_easy_setopt",
-        "cJSON_Parse",
-        "_ZN6apache6thrift9TXxxxE",
-    ):
-        assert library_origin(name) == "stock_oss_known", name
+def test_no_code_reads_a_symbol_name_to_decide_a_library_origin() -> None:
+    """MC-1. The retired guess leaves no callable behind — checked as CODE, not as text.
 
+    It read a symbol name and answered "this is third-party library code", which is the same
+    reasoning the by-name binary exclusion was retired for: it holds only while symbols are named
+    the way upstream names them, and a stripped firmware does not promise that. It was weak as well
+    as unsound — eight libraries' exported API prefixes, 558 of 28,383 instances on the real atlas,
+    while the same libraries' internal functions went through unlabelled.
 
-def test_unknown_symbols_are_not_classified() -> None:
-    # Custom-looking names never become a library origin (and NEVER default to custom).
-    for name in ("handle_request", "ssl_helper", "my_json_parse", "main", None):
-        assert library_origin(name) is None, name
+    Parsed rather than grepped for a specific reason: the retirement NOTE in downweight.py names
+    both symbols on purpose, so that someone about to re-add this reads why it went first. A text
+    scan would either fail on that note or force it to be deleted, and the note is the part worth
+    keeping. This looks at names the code actually uses — definitions, imports, calls.
+
+    MUTATION (must go RED): re-add ``def library_origin`` anywhere under src/, or call it."""
+    import ast
+
+    retired = {"library_origin", "_THIRD_PARTY_SYMBOL_RE"}
+    offenders: list[str] = []
+    for path in sorted(_SRC.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            used: set[str] = set()
+            if isinstance(node, ast.Name):
+                used = {node.id}
+            elif isinstance(node, ast.Attribute):
+                used = {node.attr}
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                used = {node.name}
+            elif isinstance(node, ast.ImportFrom):
+                used = {a.name for a in node.names} | {a.asname or "" for a in node.names}
+            if used & retired:
+                offenders.append(f"{path.relative_to(_SRC)}:{getattr(node, 'lineno', '?')}")
+    assert not offenders, f"retired symbol still live in: {offenders}"
 
 
 # ── boundary: neutral, no banned vocabulary, no vendor strings ───────────────────────

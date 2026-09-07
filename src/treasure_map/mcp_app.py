@@ -1251,7 +1251,9 @@ def make_tools(
         ``next_offset``) so the tail past ``limit`` is reachable. DERIVED, NOT a verdict.
 
         ★ the bound loosened materially when scan-time exclusion was retired: instances from
-        widely-shipped stock binaries count here until origin is component-confirmed."""
+        widely-shipped stock binaries count here — every instance a current run writes is
+        'unknown', so nothing is excluded. Read it as "distinct bodies matching this shape",
+        not as "distinct bodies written for this device"."""
         conn = open_atlas(atlas_path)
         try:
             rows = _ledger(conn)
