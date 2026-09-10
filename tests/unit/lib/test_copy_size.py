@@ -11,14 +11,20 @@ source-length copy, an unrelated clamp) must never be demoted.
 from __future__ import annotations
 
 from treasure_map.lib.reachability.copy_size import (
+    SIZE_APPEND_CONST,
+    SIZE_APPEND_VARIABLE,
+    SIZE_CAP_CONST,
+    SIZE_CAP_VARIABLE,
     SIZE_CLAMP,
     SIZE_CONST,
+    SIZE_NO_BOUND,
     SIZE_POINTER_GUARD,
     SIZE_SIZEOF,
     SIZE_SOURCE_LEN,
     SIZE_UNTRACED,
     SIZE_VARIABLE,
     classify_copy_size,
+    classify_format_size,
     copy_size_form_note,
 )
 
@@ -179,3 +185,93 @@ def test_occurrence_counts_calls_to_its_own_callee() -> None:
     pseudo = "memcpy(a, b, 4); strcpy(x, y); memcpy(c, d, n);"
     assert classify_copy_size(pseudo, "memcpy", occurrence=1).size_var == "n"
     assert classify_copy_size(pseudo, "strcpy", occurrence=0).kind == SIZE_SOURCE_LEN
+
+
+# ── buffer formatters: the length comes from the SIGNATURE ───────────────────────────
+
+
+def test_each_formatter_family_reports_what_its_signature_provides() -> None:
+    """The three facts, one per signature shape. None of them is a verdict about the destination.
+
+    A cap bounds the WRITE; whether the destination is that large is a fact about the destination,
+    which the call does not carry. An append amount is not a total — the destination's existing
+    contents are added to it. And a formatter with no length parameter is not "untraced": there is
+    nothing to trace, which is a different and stronger statement.
+
+    MUTATION (must go RED): map any family to a copy kind. SIZE_CONST for a const cap is the
+    tempting one, and it would demote every capped formatter — SIZE_CONST is in _FORM_NOTE."""
+    assert classify_format_size('snprintf(d, 64, "%s", x);', "snprintf").kind == SIZE_CAP_CONST
+    assert classify_format_size('snprintf(d, n, "%s", x);', "snprintf").kind == SIZE_CAP_VARIABLE
+    assert classify_format_size("vsnprintf(d, 64, f, ap);", "vsnprintf").kind == SIZE_CAP_CONST
+    assert classify_format_size("strncat(d, s, 8);", "strncat").kind == SIZE_APPEND_CONST
+    assert classify_format_size("strncat(d, s, k);", "strncat").kind == SIZE_APPEND_VARIABLE
+    assert classify_format_size('sprintf(d, "%s", x);', "sprintf").kind == SIZE_NO_BOUND
+    assert classify_format_size("vsprintf(d, f, ap);", "vsprintf").kind == SIZE_NO_BOUND
+    assert classify_format_size("strcat(d, s);", "strcat").kind == SIZE_NO_BOUND
+
+
+def test_a_constant_format_string_does_not_remove_a_cap() -> None:
+    """★ The kind comes from the signature, never from how readable the format string is.
+
+    ``snprintf(dst, 64, "no percent here")`` really does carry a cap. Calling it unbounded because
+    nothing expands into it would emit a length fact that is false about the call — and on one real
+    firmware there are 11 of exactly this shape. Which is why "how much of the format could be
+    read" is recorded as its own axis instead of being folded into the length.
+
+    MUTATION (must go RED): decide the kind from whether the format string contains a %."""
+    assert classify_format_size('snprintf(d, 64, "no percent here");', "snprintf").kind == (
+        SIZE_CAP_CONST
+    )
+    assert classify_format_size('sprintf(d, "no percent here");', "sprintf").kind == SIZE_NO_BOUND
+
+
+def test_reading_a_fixed_argument_position_would_read_the_format_string() -> None:
+    """Why the position is per-callee and not "the third argument, like a copy".
+
+    snprintf's cap is argument 1 and sprintf's FORMAT STRING is argument 1; snprintf's argument 2
+    is its format. A single fixed rule borrowed from memcpy would hand the classifier a format
+    literal as a length on every snprintf in the firmware. Pinned here as an assertion about the
+    arguments themselves so the reason survives the code.
+
+    MUTATION (must go RED): use one position for the whole family."""
+    from treasure_map.lib.reachability.copy_size import _call_args
+
+    args = _call_args('snprintf(dst, 64, "%s", x);', "snprintf", 0)
+    assert args is not None
+    assert args[1].strip() == "64"  # the cap
+    assert args[2].strip() == '"%s"'  # the format — what a memcpy-shaped rule would have read
+    assert classify_format_size('snprintf(dst, 64, "%s", x);', "snprintf").size_text == "64"
+
+
+def test_no_formatter_length_can_demote_a_candidate() -> None:
+    """MC-a2, at the source: none of the five kinds carries a form note, structurally.
+
+    Only a length that PROVES the total write is bounded may demote, and none of these does — a cap
+    leaves the destination's size unknown, an append leaves the total unknown, and no_bound is the
+    absence of a limit. Asserted through ``copy_size_form_note`` rather than by inspecting the
+    table, so adding a kind to _FORM_NOTE is what turns it red.
+
+    MUTATION (must go RED): add any formatter kind to _FORM_NOTE."""
+    for kind in (
+        SIZE_CAP_CONST,
+        SIZE_CAP_VARIABLE,
+        SIZE_APPEND_CONST,
+        SIZE_APPEND_VARIABLE,
+        SIZE_NO_BOUND,
+    ):
+        assert copy_size_form_note(kind) is None, kind
+
+
+def test_an_unreadable_formatter_call_is_untraced_not_unbounded() -> None:
+    """The failure direction: what could not be read is never reported as a stronger fact.
+
+    ``no_bound`` states that the signature HAS no length parameter. A call whose arguments could
+    not be parsed has not established that, and saying so would turn a parsing gap into a claim
+    about the code.
+
+    MUTATION (must go RED): return SIZE_NO_BOUND when the arguments cannot be read."""
+    assert classify_format_size("nothing here;", "snprintf").kind == SIZE_UNTRACED
+    assert classify_format_size('snprintf(d, 64, "%s");', "snprintf", occurrence=3).kind == (
+        SIZE_UNTRACED
+    )
+    assert classify_format_size("memcpy(d, s, 4);", "memcpy").kind == SIZE_UNTRACED

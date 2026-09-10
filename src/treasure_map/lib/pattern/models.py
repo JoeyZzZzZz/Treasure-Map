@@ -22,6 +22,10 @@ PatternKind = Literal[
     "bare_cmd_shape",
     "fmt_string_shape",
     "path_sink_shape",
+    # A buffer formatter writing into a destination — the same write-length axis as a copy, on the
+    # printf-family calls that build a string in place (sprintf/snprintf/strcat/...). Emitted per
+    # CALLSITE for the same reason overflow_shape is: the length belongs to the call.
+    "format_overflow_shape",
 ]
 
 
@@ -54,7 +58,7 @@ class PatternMatch:
     # WHICH CALL in the function this match is about, for a shape emitted per CALLSITE rather than
     # per function. ``sink_callsite_index`` orders the function's callsites of this sink class
     # across callee names; ``sink_callsite_occurrence`` is the ordinal among calls to THIS callee,
-    # which is what a per-call reader needs (see classes.copy_callsites). Both stay None for a
+    # which is what a per-call reader needs (see classes.sink_callsites). Both stay None for a
     # function-level match — the shapes that emit one candidate per function, and the copy shape
     # when no call to its callee can be located in the decompiled text. None means "not anchored
     # to a callsite", never "the first one": a reader that defaulted it to 0 would silently claim
@@ -80,6 +84,7 @@ class PatternStats:
     bare_cmd: int = 0  # bare_cmd_shape matches (cmd sink, no constructed shell command)
     fmt_string: int = 0  # fmt_string_shape matches (non-literal format-string sink)
     path_sink: int = 0  # path_sink_shape matches (path/file sink — fopen/open/unlink/rename/…)
+    format_overflow: int = 0  # format_overflow_shape matches (buffer formatter write, per callsite)
 
 
 @dataclass(frozen=True)

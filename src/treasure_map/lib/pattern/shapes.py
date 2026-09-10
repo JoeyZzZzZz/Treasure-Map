@@ -27,7 +27,7 @@ from treasure_map.lib.pattern.classes import (
     PATH_SINK,
     SOURCE,
     all_format_calls_literal,
-    copy_callsites,
+    sink_callsites,
 )
 from treasure_map.lib.pattern.fingerprint import (
     FINGERPRINT_ALGO_VERSION,
@@ -203,7 +203,7 @@ def pattern_b(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[Pa
     if not cc.copy:
         return []
     shape = "source->copy" if cc.source else "copy"
-    sites = copy_callsites(pseudocode, cc.copy)
+    sites = sink_callsites(pseudocode, cc.copy)
     if not sites:
         return [
             _match(func_ref, "overflow_shape", _source_class(cc), "copy", shape, sorted(cc.copy)[0])
@@ -214,6 +214,62 @@ def pattern_b(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[Pa
             "overflow_shape",
             _source_class(cc),
             "copy",
+            shape,
+            site.sink_name,
+            sink_callsite_index=site.index,
+            sink_callsite_occurrence=site.occurrence,
+        )
+        for site in sites
+    ]
+
+
+def pattern_format(func_ref: FuncRef, callees: list[str], pseudocode: str) -> list[PatternMatch]:
+    """Buffer-formatter write shape: ONE candidate per formatter CALLSITE.
+
+    snprintf / sprintf / vsnprintf / vsprintf / strcat / strncat all build a string INTO a
+    destination buffer. That is the same write-length axis a copy is read on, and until now not
+    one of them produced a candidate — the class comment said they were "handled as copy/overflow"
+    and nothing handled them. A formatter that overruns its destination was not a low-ranked lead;
+    it had no row at all, which is the least visible way to miss one.
+
+    Per callsite, and for the same reason pattern_b is: the length belongs to the CALL. One
+    function can snprintf into a 64-byte cap at one call and sprintf with no bound at the next.
+
+    ★ Whether a candidate EXISTS here does not depend on anything being decidable about it. Not on
+    the format string — strcat has none and vsnprintf's is a variable — and not on the shape of the
+    destination. A ``param_`` destination is a buffer the CALLER owns, which is the cross-function
+    overflow this scan cannot see the size of, and dropping those would remove exactly the calls
+    whose length is hardest to reason about. Every formatter callsite is a candidate; how much can
+    be said about it is recorded separately.
+
+    ★ This does NOT take the family away from the command-injection shape. A sprintf that builds a
+    shell string still feeds pattern_a through ``cc.fmt``; the same call can be both a cmd
+    candidate and a write-length candidate, under different refs.
+
+    A function whose body spells out no call (the callee list names one, the text does not) yields
+    ONE function-level candidate with no callsite anchor — the same recall floor pattern_b keeps."""
+    cc = classify(callees)
+    if not cc.fmt:
+        return []
+    shape = "source->format" if cc.source else "format"
+    sites = sink_callsites(pseudocode, cc.fmt)
+    if not sites:
+        return [
+            _match(
+                func_ref,
+                "format_overflow_shape",
+                _source_class(cc),
+                "format",
+                shape,
+                sorted(cc.fmt)[0],
+            )
+        ]
+    return [
+        _match(
+            func_ref,
+            "format_overflow_shape",
+            _source_class(cc),
+            "format",
             shape,
             site.sink_name,
             sink_callsite_index=site.index,
@@ -287,7 +343,15 @@ Detector = Callable[[FuncRef, list[str], str], "list[PatternMatch]"]
 # present).
 #
 # HOW MANY candidates a (function, sink class) yields is now the shape's own answer, not a rule of
-# the registry: the four function-level shapes yield 0 or 1, and pattern_b yields one per copy
-# callsite. The old "at most one" held only while every shape was about a function, and reading it
-# as a guarantee is what let a function's second copy call go unrepresented.
-DETECTORS: tuple[Detector, ...] = (pattern_a, bare_cmd, pattern_b, pattern_fmtstr, pattern_path)
+# the registry: the function-level shapes yield 0 or 1, while pattern_b and pattern_format yield
+# one per callsite (the write length belongs to the call, not to the function). The old "at most
+# one" held only while every shape was about a function, and reading it as a guarantee is what let
+# a function's second copy call go unrepresented.
+DETECTORS: tuple[Detector, ...] = (
+    pattern_a,
+    bare_cmd,
+    pattern_b,
+    pattern_format,
+    pattern_fmtstr,
+    pattern_path,
+)

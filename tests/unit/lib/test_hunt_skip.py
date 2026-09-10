@@ -436,7 +436,7 @@ def test_a_second_hunt_by_the_same_commit_skips_and_touches_nothing(
 
     first = a2.run_analyzer2(db, atlas, source_run_id="r", firmware_path="/fw")
     assert first.skipped is False
-    assert first.instances_written == 1
+    assert first.instances_written == 2  # cmd + the snprintf's own write candidate
     before = _instances(atlas)
     assert before, "the fixture must actually write something, or the skip proves nothing"
 
@@ -454,7 +454,7 @@ def test_rehunt_overrides_the_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     a2.run_analyzer2(db, atlas, source_run_id="r")
     again = a2.run_analyzer2(db, atlas, source_run_id="r", rehunt=True)
     assert again.skipped is False
-    assert again.instances_written == 1
+    assert again.instances_written == 2  # cmd + the snprintf's own write candidate
 
 
 @pytest.mark.parametrize("axis", ["commit", "extraction"])
@@ -573,8 +573,8 @@ def test_the_stamp_records_how_many_rows_the_hunt_wrote(
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
     stats = a2.run_analyzer2(db, atlas, source_run_id="r")
-    assert stats.instances_written == 1
-    assert _run_column(atlas, "r", "hunt_instances") == 1
+    assert stats.instances_written == 2  # cmd + the snprintf's own write candidate
+    assert _run_column(atlas, "r", "hunt_instances") == 2
 
 
 def test_rows_deleted_out_from_under_the_stamp_defeat_the_skip(
@@ -600,7 +600,7 @@ def test_rows_deleted_out_from_under_the_stamp_defeat_the_skip(
     monkeypatch.setattr(a2, "installed_commit", lambda: COMMIT)
     db, atlas = _seeded(tmp_path), tmp_path / "atlas.db"
     a2.run_analyzer2(db, atlas, source_run_id="r")
-    assert len(_instances(atlas)) == 1
+    assert len(_instances(atlas)) == 2
 
     conn = open_atlas(atlas)
     conn.execute("DELETE FROM instance WHERE source_run_id = 'r'")
@@ -610,7 +610,7 @@ def test_rows_deleted_out_from_under_the_stamp_defeat_the_skip(
     again = a2.run_analyzer2(db, atlas, source_run_id="r")
     assert again.skipped is False
     assert "stored candidate rows changed" in (again.hunt_currency or "")
-    assert len(_instances(atlas)) == 1, "the re-hunt must restore what was deleted"
+    assert len(_instances(atlas)) == 2, "the re-hunt must restore what was deleted"
 
 
 def test_extra_rows_under_the_stamp_also_defeat_the_skip(
@@ -666,7 +666,7 @@ def test_a_run_stamped_before_the_count_existed_re_hunts_once(
     again = a2.run_analyzer2(db, atlas, source_run_id="r")
     assert again.skipped is False
     assert "before the instance count was recorded" in (again.hunt_currency or "")
-    assert _run_column(atlas, "r", "hunt_instances") == 1  # refilled by the re-hunt
+    assert _run_column(atlas, "r", "hunt_instances") == 2  # refilled by the re-hunt
 
 
 def test_a_run_that_legitimately_found_nothing_still_skips(

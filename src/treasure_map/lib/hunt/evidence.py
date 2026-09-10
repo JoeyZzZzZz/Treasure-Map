@@ -38,8 +38,11 @@ from treasure_map.lib.hunt.downweight import (
 )
 from treasure_map.lib.pattern.classes import (
     FMT_STRING_ARG,
+    FORMAT_ARG,
     SOURCE,
+    _split_top_args,
     all_format_calls_literal,
+    call_offsets,
     format_string_ident,
 )
 from treasure_map.lib.reachability.copy_size import (
@@ -47,6 +50,7 @@ from treasure_map.lib.reachability.copy_size import (
     SIZE_SIZEOF,
     SIZE_UNTRACED,
     classify_copy_size,
+    classify_format_size,
 )
 from treasure_map.lib.reachability.filters import _is_validator_name
 from treasure_map.lib.reachability.taint import (
@@ -337,6 +341,95 @@ def build_size_evidence(
             "sites": entry_sites or [],
         },
         "trace_boundary": _size_trace_boundary(pseudocode, cs.kind, cs.size_var, deps),
+    }
+
+
+# How much could be said about the FORMAT STRING of a buffer-formatter call. A separate axis from
+# the write length on purpose: the length comes from the callee's SIGNATURE and is known for every
+# call, while the format string may be a literal, a variable, or absent entirely. Collapsing the
+# two would let "we could not read the format" quietly become "there is no cap", which is a false
+# statement about the call.
+FMT_LITERAL_WITH_ARGS = "literal_with_args"  # a literal carrying % — the expansions are readable
+FMT_LITERAL_CONSTANT = "literal_constant"  # a literal with no % — nothing expands into the buffer
+FMT_UNRESOLVED = "unresolved"  # a variable format, or a callee with no format string at all
+
+
+def _format_string_resolution(pseudocode: str, sink_name: str, occurrence: int) -> str:
+    """Which of the three states this call's format string is in. Never a judgement about risk."""
+    pos = FORMAT_ARG.get(sink_name)
+    if pos is None:
+        return FMT_UNRESOLVED  # strcat / strncat carry no format string to read
+    offsets = call_offsets(pseudocode, sink_name)
+    if occurrence < 0 or occurrence >= len(offsets):
+        return FMT_UNRESOLVED
+    i = offsets[occurrence]
+    depth = 0
+    args: list[str] = []
+    for j in range(i, len(pseudocode)):
+        if pseudocode[j] == "(":
+            depth += 1
+        elif pseudocode[j] == ")":
+            depth -= 1
+            if depth == 0:
+                args = _split_top_args(pseudocode[i + 1 : j])
+                break
+    if pos >= len(args):
+        return FMT_UNRESOLVED
+    fmt = args[pos].strip()
+    if not (fmt.startswith('"') or fmt.startswith('L"')):
+        return FMT_UNRESOLVED
+    return FMT_LITERAL_WITH_ARGS if "%" in fmt else FMT_LITERAL_CONSTANT
+
+
+def build_format_size_evidence(
+    *,
+    pseudocode: str,
+    sink_name: str,
+    entry_sites: list[dict[str, Any]] | None = None,
+    callsite_index: int | None = None,
+    occurrence: int = 0,
+) -> dict[str, Any]:
+    """The write-length evidence for one buffer-formatter candidate (JSON-serializable).
+
+    The same shape ``build_size_evidence`` produces for a copy, so one reader handles both, plus
+    one field the copy axis has no equivalent for: ``format_string``, saying how much could be read
+    of the format. That is deliberately NOT folded into ``size_kind`` — the length comes from the
+    callee's signature and is known for every call, while the format string may be unreadable, and
+    letting the second overwrite the first is how ``snprintf(dst, 64, fmt_var, ...)`` would come
+    back claiming no cap exists.
+
+    EVIDENCE, never a verdict. Nothing here says the destination is too small; the call does not
+    carry the destination's size, and inventing one is the failure this whole axis is written
+    around."""
+    fs = classify_format_size(pseudocode, sink_name, occurrence=occurrence)
+    deps = _derives_map(pseudocode)
+    if fs.size_var is not None:
+        real = _real_vars(pseudocode, deps)
+        one_hop = sorted(v for v in deps.get(fs.size_var, set()) if v in real)
+    else:
+        one_hop = []
+    anchored = callsite_index is not None
+    return {
+        "size_kind": fs.kind,
+        "copy_callsite": {
+            "sink": sink_name,
+            "index": callsite_index,
+            "occurrence": occurrence if anchored else None,
+            "anchor": "callsite" if anchored else "function",
+        },
+        "format_string": _format_string_resolution(pseudocode, sink_name, occurrence)
+        if anchored
+        else FMT_UNRESOLVED,
+        "size_flow": {"size_arg": fs.size_text, "size_var": fs.size_var, "one_hop": one_hop},
+        # A formatter's length is a cap or an append amount, not a clamped variable, so the
+        # clamp search the copy axis runs does not apply. Present and empty rather than absent:
+        # the reader treats a missing key as "no picture at all".
+        "clamp_seen": [],
+        "entry_reach": {
+            "status": "found" if entry_sites else "unknown",
+            "sites": entry_sites or [],
+        },
+        "trace_boundary": _size_trace_boundary(pseudocode, fs.kind, fs.size_var, deps),
     }
 
 

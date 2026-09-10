@@ -170,6 +170,17 @@ FMT_STRING_ARG: dict[str, int] = {
     "vasprintf": 1,
 }
 
+# Which argument of a BUFFER formatter is its format string. Distinct from FMT_STRING_ARG above,
+# which is about the printf-family interpreters; these write into a destination instead, and their
+# format sits after it. strcat / strncat are absent because they have no format string at all —
+# absence here means "this callee has none", never "we did not look".
+FORMAT_ARG: dict[str, int] = {
+    "sprintf": 1,  # sprintf(dst, FMT, ...)
+    "vsprintf": 1,  # vsprintf(dst, FMT, ap)
+    "snprintf": 2,  # snprintf(dst, cap, FMT, ...)
+    "vsnprintf": 2,  # vsnprintf(dst, cap, FMT, ap)
+}
+
 # Path / file sinks: a controllable PATH argument enables directory traversal / arbitrary file
 # read / write / delete. Mechanism-only, generic libc/POSIX names (no vendor symbol). The danger
 # axis is the PATH argument, whose position is per-sink (see PATH_SINK_ARG) — NOT always arg0.
@@ -375,14 +386,19 @@ def call_offsets(pseudocode: str, name: str) -> tuple[int, ...]:
 
 
 @dataclass(frozen=True)
-class CopyCallsite:
-    """One textual call to a copy callee inside a function's pseudocode.
+class SinkCallsite:
+    """One textual call to a sink callee inside a function's pseudocode.
 
-    ``index`` orders every copy call in the function by position, ACROSS copy names, so it names a
-    callsite the same way on every re-scan of the same body. ``occurrence`` is the 0-based ordinal
+    ``index`` orders every call in the enumerated set by position, ACROSS callee names, so it names
+    a callsite the same way on every re-scan of the same body. ``occurrence`` is the 0-based ordinal
     of this call among calls to ``sink_name`` alone — the number a per-call reader needs to look at
-    THIS call rather than at the first one. They differ as soon as a function copies with two
-    different callees (measured: 66 of 1380 copy-carrying functions on one real firmware).
+    THIS call rather than at the first one. They differ as soon as a function calls two different
+    callees of the set (measured: 66 of 1380 copy-carrying functions on one real firmware).
+
+    Named for SINKS, not for copies: the buffer formatters are read on the same write-length axis
+    and enumerate their callsites through the same function. One enumerator is the point — the
+    detector that emits a candidate per call and the reader that classifies each call have to agree
+    about which call is the second one.
     """
 
     index: int
@@ -390,7 +406,7 @@ class CopyCallsite:
     occurrence: int
 
 
-def copy_callsites(pseudocode: str, sink_names: Iterable[str]) -> tuple[CopyCallsite, ...]:
+def sink_callsites(pseudocode: str, sink_names: Iterable[str]) -> tuple[SinkCallsite, ...]:
     """Every textual call to one of ``sink_names``, in source order.
 
     A name with no textual call contributes nothing. The callee list can name a callee the
@@ -399,6 +415,9 @@ def copy_callsites(pseudocode: str, sink_names: Iterable[str]) -> tuple[CopyCall
     call that is not there. What to do with an EMPTY result is the caller's decision and it is not
     "emit nothing": on one real firmware 49 of 1380 copy-carrying functions are in that state, so a
     caller that dropped them would trade a per-callsite gain for a silent recall loss.
+
+    Callee-set agnostic on purpose — the copy sinks and the buffer formatters both come through
+    here. It answers "where are the calls", never "which calls are worth a candidate".
     """
     sites = [
         (offset, name, occurrence)
@@ -407,6 +426,6 @@ def copy_callsites(pseudocode: str, sink_names: Iterable[str]) -> tuple[CopyCall
     ]
     sites.sort()
     return tuple(
-        CopyCallsite(index=index, sink_name=name, occurrence=occurrence)
+        SinkCallsite(index=index, sink_name=name, occurrence=occurrence)
         for index, (_offset, name, occurrence) in enumerate(sites)
     )

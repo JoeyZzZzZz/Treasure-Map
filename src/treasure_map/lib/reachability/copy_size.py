@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from treasure_map.lib.pattern.classes import call_offsets
+from treasure_map.lib.pattern.classes import FORMAT, call_offsets
 from treasure_map.lib.reachability.taint import _IDENT_RE
 
 # Size-source kinds (mechanism labels, not verdicts).
@@ -45,6 +45,25 @@ SIZE_POINTER_GUARD = "pointer_guard"
 SIZE_SOURCE_LEN = "source_len"
 SIZE_VARIABLE = "variable"
 SIZE_UNTRACED = "untraced"
+
+# Write-length kinds for the buffer FORMATTERS. Separate labels rather than reused copy ones,
+# because what their size argument MEANS is different and collapsing them would state a stronger
+# fact than the call supports:
+#   cap_*     — snprintf/vsnprintf take a maximum to write. That bounds the WRITE, and says
+#               nothing about whether the destination is that big; "capped at n" is the fact,
+#               "safe" is not.
+#   append_*  — strncat takes how much to APPEND. The total written is that plus whatever the
+#               destination already holds, which this pass does not know. Reading it as a total
+#               would be the same mistake as reading a cap as a capacity, one step worse.
+#   no_bound  — sprintf/vsprintf/strcat have no length parameter at all. The fact is the absence
+#               of any limit in the call, which is a fact about the call and not a claim about
+#               what reaches it.
+# None of the five is in _FORM_NOTE below, so none of them can ever demote a candidate.
+SIZE_CAP_CONST = "cap_const"
+SIZE_CAP_VARIABLE = "cap_variable"
+SIZE_APPEND_CONST = "append_const"
+SIZE_APPEND_VARIABLE = "append_variable"
+SIZE_NO_BOUND = "no_bound"
 
 # Neutral form notes (stored in blocking_mechanism; the read-side score downweights them). Only
 # the provably-length-controlled kinds get one — the suspect/unbounded kinds stay un-noted so a
@@ -65,6 +84,23 @@ _FORM_NOTE: dict[str, str] = {
 _SIZED_COPY: frozenset[str] = frozenset({"memcpy", "memmove", "strncpy"})
 # Copies with an IMPLICIT length = the source string length (no length argument).
 _UNSIZED_COPY: frozenset[str] = frozenset({"strcpy"})
+
+# Which argument of a buffer formatter carries a length, and what that length MEANS. Lives here
+# rather than in the call-class vocabulary for the same reason _SIZED_COPY does: the position is
+# inseparable from the kind it produces, and splitting them across two modules is how the two
+# drift. Absent from the map = the call takes no length at all.
+#
+# ★ The position is not guessable and reading the wrong one is not a small error: snprintf's cap
+# is argument 1 and sprintf's FORMAT STRING is argument 1, so a single "read args[2] as the size"
+# rule reads snprintf's format string as a length — measured as wrong on 100% of them. Every entry
+# below is the callee's real signature.
+_CAP_ARG: dict[str, int] = {
+    "snprintf": 1,  # snprintf(dst, CAP, fmt, ...)
+    "vsnprintf": 1,  # vsnprintf(dst, CAP, fmt, ap)
+}
+_APPEND_ARG: dict[str, int] = {
+    "strncat": 2,  # strncat(dst, src, HOW MUCH TO APPEND)
+}
 
 # String-length callees: a length taken from one is the source's own length (source_len).
 _STRLEN_RE = re.compile(r"\b(?:strlen|strnlen|wcslen)\s*\(")
@@ -195,6 +231,65 @@ def _pointer_guards(pseudocode: str, var: str) -> tuple[str, ...]:
         (rf"\w+\s*\+\s*{v}\s*[<>]=?\s*\w+", "base + v < bound"),
     )
     return tuple(label for pat, label in shapes if re.search(pat, pseudocode))
+
+
+def classify_format_size(pseudocode: str, sink_name: str, *, occurrence: int = 0) -> CopySize:
+    """Classify the write-length of the ``occurrence``-th ``sink_name`` FORMATTER call.
+
+    The buffer formatters (snprintf/sprintf/vsnprintf/vsprintf/strcat/strncat) write into a
+    destination exactly as a copy does, and until now none of them was read on that axis at all —
+    the whole family produced no candidate, so a formatter that overruns its destination was not a
+    low-ranked lead, it was absent.
+
+    What comes back is a length FACT, never a verdict. Three of them, by what the call's signature
+    actually provides:
+
+      "there is no length parameter"      — sprintf / vsprintf / strcat        -> no_bound
+      "the write is capped at n"          — snprintf / vsnprintf (arg 1)       -> cap_*
+      "n more bytes are appended"         — strncat (arg 2)                    -> append_*
+
+    None of them says whether the destination is big enough, because the call does not say. A cap
+    is not a capacity and an append amount is not a total; the destination's size is a fact about
+    the destination, and this reads a call. That is why none of the five kinds carries a form note
+    (see ``_FORM_NOTE``): a candidate here is never demoted on the strength of a number that does
+    not answer the question.
+
+    ★ A constant does not change which kind applies. ``snprintf(dst, 64, "no percent here")`` is
+    cap_const, NOT no_bound — the call really does carry a cap, and saying otherwise would emit a
+    length fact that is simply false about the call. The kind comes from the SIGNATURE; whether the
+    format string is a literal is a separate axis the detector records separately.
+
+    An unreadable call, an occurrence that is not there, or a non-formatter ``sink_name`` yields
+    ``untraced``."""
+    if sink_name not in FORMAT:
+        return CopySize(SIZE_UNTRACED, None, None)
+    args = _call_args(pseudocode, sink_name, occurrence)
+    if args is None:
+        return CopySize(SIZE_UNTRACED, None, None)
+
+    pos = _CAP_ARG.get(sink_name)
+    const_kind, var_kind = SIZE_CAP_CONST, SIZE_CAP_VARIABLE
+    if pos is None:
+        pos = _APPEND_ARG.get(sink_name)
+        const_kind, var_kind = SIZE_APPEND_CONST, SIZE_APPEND_VARIABLE
+    if pos is None:
+        # No length parameter in the signature at all. Not a failure to read one — there is none.
+        return CopySize(SIZE_NO_BOUND, None, None)
+    if pos >= len(args):
+        return CopySize(SIZE_UNTRACED, None, None)
+
+    size = args[pos].strip()
+    if _NUM_LITERAL_RE.match(size):
+        return CopySize(const_kind, size, None)
+    if "sizeof" in size:
+        # A sizeof still bounds only the WRITE here, not the destination's capacity relative to
+        # what gets formatted into it, so it stays a cap/append kind rather than borrowing the
+        # copy path's sizeof — which does carry a form note and would demote this.
+        return CopySize(const_kind, size, None)
+    var = _lead_ident(size)
+    if var is None:
+        return CopySize(SIZE_UNTRACED, size, None)
+    return CopySize(var_kind, size, var)
 
 
 def classify_copy_size(pseudocode: str, sink_name: str, *, occurrence: int = 0) -> CopySize:

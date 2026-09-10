@@ -73,6 +73,7 @@ from treasure_map.lib.hunt.evidence import (
     EntryIndex,
     build_flow_evidence,
     build_fmtstr_evidence,
+    build_format_size_evidence,
     build_size_evidence,
     load_entry_index,
 )
@@ -1235,8 +1236,12 @@ def run_analyzer2(
                 #   copy       — the callee AT THIS CANDIDATE'S CALLSITE. Re-deriving would pick
                 #                one name for the whole function and hand a strcpy candidate the
                 #                memcpy that happens to sort first.
+                #   format     — same, for the buffer formatters. The mistake would be worse here:
+                #                the length ARGUMENT POSITION differs by callee (snprintf's cap is
+                #                argument 1, strncat's append amount is argument 2), so a candidate
+                #                handed the wrong callee's name reads the wrong argument entirely.
                 sink_name: str | None
-                if match.sink_class in ("fmt_string", "copy"):
+                if match.sink_class in ("fmt_string", "copy", "format"):
                     sink_name = match.evidence
                 else:
                     sink_name = _sink_name_for(callees, match.sink_class)
@@ -1275,12 +1280,14 @@ def run_analyzer2(
                 # unlabelled anyway. Saying 'unknown' is the honest answer: this pass reads a
                 # function body, and where its code originally came from is not in it.
                 origin = "unknown"
-                # detect_form_signal reads the cmd danger axis (arg0). Copy sinks are graded on the
-                # write length, and format-string sinks on their per-sink format argument, by the
-                # grader — so the cmd-axis form notes must not run for either (they would read the
-                # wrong argument). Their FP-suppression lives elsewhere: copy in the size grade, the
-                # format-string literal exemption in the recall detector.
-                if blocking is None and match.sink_class not in ("copy", "fmt_string"):
+                # detect_form_signal reads the cmd danger axis (arg0). Copy and format sinks are
+                # graded on the write length, and format-string sinks on their per-sink format
+                # argument, by the grader — so the cmd-axis form notes must not run for any of them
+                # (they would read the wrong argument; for a formatter arg0 is the DESTINATION
+                # POINTER, and a note attached from it would demote on a reading of the wrong
+                # value). Their FP-suppression lives elsewhere: copy and format in the size grade,
+                # the format-string literal exemption in the recall detector.
+                if blocking is None and match.sink_class not in ("copy", "fmt_string", "format"):
                     callers_pc = [
                         funcs[cid].pseudocode or ""
                         for cid in callers_of.get(match.func_ref.func_id, ())
@@ -1369,6 +1376,23 @@ def run_analyzer2(
                         size_ev, edge_leads, row.binary_name, match.func_ref.func_name
                     )
                     flow_evidence = json.dumps(size_ev, sort_keys=True)
+                elif match.sink_class == "format" and sink_name is not None:
+                    # Buffer-formatter candidates carry the same WRITE-LENGTH evidence a copy does
+                    # — what the call's signature provides (a cap, an append amount, or nothing at
+                    # all), plus how much of the format string could be read. Never a verdict:
+                    # none of it says the destination is big enough, because the call does not.
+                    sites = entry_index.sites_for(row.binary_name, row.binary_path)
+                    fmt_size_ev = build_format_size_evidence(
+                        pseudocode=row.pseudocode,
+                        sink_name=sink_name,
+                        entry_sites=sites,
+                        callsite_index=match.sink_callsite_index,
+                        occurrence=copy_occurrence,
+                    )
+                    _attach_edge_leads(
+                        fmt_size_ev, edge_leads, row.binary_name, match.func_ref.func_name
+                    )
+                    flow_evidence = json.dumps(fmt_size_ev, sort_keys=True)
                 elif match.sink_class == "fmt_string" and sink_name is not None:
                     # Format-string candidates carry flow evidence on the FORMAT argument plus the
                     # format-position facts (which arg is the format; literal-only or not).

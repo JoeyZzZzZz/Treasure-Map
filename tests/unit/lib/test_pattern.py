@@ -86,7 +86,9 @@ def test_pattern_a_positive(tmp_path: Path) -> None:
 
     assert res.stats.pattern_a == 1
     assert res.stats.pattern_b == 0
-    (m,) = res.matches
+    # The snprintf is separately a buffer-formatter WRITE candidate — a different shape on a
+    # different axis, at its own ref. This test is about the command shape, so it takes that one.
+    (m,) = [m for m in res.matches if m.sink_class == "cmd"]
     assert m.pattern_kind == "cmd_injection_shape"
     assert m.source_class == "external_input"
     assert m.sink_class == "cmd"
@@ -120,7 +122,7 @@ def test_pattern_a_non_shellish_literal_falls_back_to_bare_cmd(tmp_path: Path) -
     # bare_cmd candidate, to be ranked low downstream rather than omitted.
     assert res.stats.pattern_a == 0
     assert res.stats.bare_cmd == 1
-    (m,) = res.matches
+    (m,) = [m for m in res.matches if m.sink_class == "cmd"]
     assert m.pattern_kind == "bare_cmd_shape"
     assert m.sink_class == "cmd"
 
@@ -144,7 +146,7 @@ def test_bare_cmd_with_no_source_is_listed(tmp_path: Path) -> None:
         ],
     )
     res = scan(db)
-    (m,) = res.matches
+    (m,) = [m for m in res.matches if m.sink_class == "cmd"]
     assert m.pattern_kind == "bare_cmd_shape"
     assert m.source_class == "unknown"  # no in-function source recognized
     assert m.call_sequence_shape == "cmd"
@@ -189,7 +191,7 @@ def test_widened_source_recognizes_getopt(tmp_path: Path) -> None:
         ],
     )
     res = scan(db)
-    (m,) = res.matches
+    (m,) = [m for m in res.matches if m.sink_class == "cmd"]
     assert m.pattern_kind == "cmd_injection_shape"
     assert m.source_class == "external_input"  # getopt_long recognized as a source
 
@@ -791,3 +793,130 @@ def test_function_level_shapes_still_yield_at_most_one(tmp_path: Path) -> None:
     for m in res.matches:
         per_class[m.sink_class] = per_class.get(m.sink_class, 0) + 1
     assert per_class == {"cmd": 1, "fmt_string": 1, "path_sink": 1}
+
+
+# ── a buffer formatter writing into a destination is a candidate per CALLSITE ─────────
+#
+# snprintf / sprintf / vsnprintf / vsprintf / strcat / strncat all build a string INTO a buffer.
+# The class comment said they were "handled as copy/overflow" and nothing handled them, so the
+# whole family produced no candidates at all — a formatter that overruns its destination had no
+# row anywhere. These emit one per call, on the same write-length axis a copy uses.
+
+_VISIBLE_FORMAT_CALL = re.compile(rf"\b(?:{'|'.join(sorted(FORMAT))})\s*\(")
+
+
+def _format_matches(tmp_path: Path, pseudocode: str, callees: list[str] | None = None) -> list:  # type: ignore[type-arg]
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "svcd",
+                "funcs": [
+                    {
+                        "name": "handler",
+                        "pseudocode": pseudocode,
+                        "callees": callees or sorted(FORMAT),
+                    }
+                ],
+            }
+        ],
+    )
+    return [m for m in scan(db).matches if m.sink_class == "format"]
+
+
+def test_every_formatter_callsite_is_a_candidate(tmp_path: Path) -> None:
+    """MC-a1, precise arm: as many candidates as there are formatter calls to see.
+
+    Counted with this test's own matcher over the same text, so it is not the enumerator agreeing
+    with itself. The vocabulary comes from the shared FORMAT set — a test carrying its own copy of
+    the callee names would go stale the day one is added.
+
+    MUTATION (must go RED): emit once per function, or once per callee NAME instead of per call."""
+    bodies = {
+        "one": 'sprintf(d, "%s", x);',
+        "mixed": 'sprintf(a, "%s", x); snprintf(b, 64, "%s", y); strcat(c, s); strncat(e, s, 8);',
+        "repeat": 'snprintf(a, 16, "%s", x); snprintf(b, n, "%s", y); snprintf(c, 32, "z");',
+    }
+    for label, body in bodies.items():
+        matches = _format_matches(tmp_path / label, body)
+        assert len(matches) == len(_VISIBLE_FORMAT_CALL.findall(body)), label
+
+
+def test_a_formatter_the_body_never_spells_out_still_yields_one_candidate(
+    tmp_path: Path,
+) -> None:
+    """MC-a1, fallback arm: the recall floor, counted against the CALLEE list rather than the text.
+
+    A regex denominator cannot express this case — the text holds zero calls and one candidate is
+    correct — which is why the site-coverage check has two arms instead of one equation that would
+    be red by construction here.
+
+    MUTATION (must go RED): return [] when the enumerator finds no site."""
+    matches = _format_matches(
+        tmp_path / "ptr", "code *pcVar1; pcVar1 = sprintf; (*pcVar1)(d, s);", ["sprintf"]
+    )
+    assert len(matches) == 1
+    assert matches[0].sink_callsite_index is None
+    assert matches[0].evidence == "sprintf"
+
+
+def test_whether_a_formatter_is_a_candidate_does_not_depend_on_its_destination(
+    tmp_path: Path,
+) -> None:
+    """★ Existence is decided by "is this a write sink", never by how much can be said about it.
+
+    A ``param_`` destination is a buffer the CALLER owns — the cross-function overflow this scan
+    cannot see the size of, and on one real firmware the second most common destination shape.
+    Gating emission on a recognizable stack array would drop exactly the calls whose length is
+    hardest to reason about, and would do it silently: there would be no row to notice missing.
+    The same for a heap pointer or a global.
+
+    Asserted on the CALLSITE ANCHOR and not on the count, because the count alone cannot tell the
+    two apart: a destination filter would empty the callsite list, the recall floor would fire, and
+    one function-level candidate would come back looking like a hit. The anchored index is what says
+    the call itself was seen.
+
+    MUTATION (must go RED): require the destination to look like a stack buffer."""
+    for label, dst in (
+        ("stack", "acStack_64"),
+        ("param", "param_1"),
+        ("heap", "puVar3"),
+        ("global", "DAT_00410000"),
+        ("member", "*(char *)(param_1 + 0x18)"),
+    ):
+        matches = _format_matches(tmp_path / label, f'sprintf({dst}, "%s", x);', ["sprintf"])
+        assert len(matches) == 1, label
+        assert matches[0].sink_callsite_index == 0, label  # the CALL was seen, not a fallback
+        assert matches[0].sink_callsite_occurrence == 0, label
+
+
+def test_a_formatter_building_a_shell_command_is_still_a_command_candidate(
+    tmp_path: Path,
+) -> None:
+    """MC-a3. The write-length axis is added alongside the command axis, not instead of it.
+
+    A sprintf that assembles a shell string feeds the command-injection shape through the same
+    callee set. Emitting it as a write candidate must not take it out of that shape: the two are
+    different questions about one call, and they land at different refs.
+
+    MUTATION (must go RED): route FORMAT away from the cmd shape (drop cc.fmt from pattern_a's
+    gate, or stop classifying FORMAT into cc.fmt)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db = _make_db(
+        tmp_path,
+        [
+            {
+                "name": "webd",
+                "funcs": [
+                    {
+                        "name": "run",
+                        "pseudocode": 'snprintf(cmd, 128, "/usr/bin/tool %s", arg); system(cmd);',
+                        "callees": ["snprintf", "system"],
+                    }
+                ],
+            }
+        ],
+    )
+    by_class = {m.sink_class for m in scan(db).matches}
+    assert by_class == {"cmd", "format"}

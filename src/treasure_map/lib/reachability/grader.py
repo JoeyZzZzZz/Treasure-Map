@@ -23,16 +23,22 @@ confirmed defect or a publishable result.
 
 from __future__ import annotations
 
-from treasure_map.lib.pattern.classes import COPY, FMT_STRING
+from treasure_map.lib.pattern.classes import COPY, FMT_STRING, FORMAT
 from treasure_map.lib.reachability.copy_size import (
+    SIZE_APPEND_CONST,
+    SIZE_APPEND_VARIABLE,
+    SIZE_CAP_CONST,
+    SIZE_CAP_VARIABLE,
     SIZE_CLAMP,
     SIZE_CONST,
+    SIZE_NO_BOUND,
     SIZE_POINTER_GUARD,
     SIZE_SIZEOF,
     SIZE_SOURCE_LEN,
     SIZE_UNTRACED,
     SIZE_VARIABLE,
     classify_copy_size,
+    classify_format_size,
     copy_size_form_note,
 )
 from treasure_map.lib.reachability.filters import (
@@ -125,6 +131,33 @@ _COPY_BASIS: dict[str, str] = {
 }
 
 
+# What each formatter write-length kind states — the fact, and where it stops. Each says
+# something about the CALL and nothing about the destination's capacity, which is the line these
+# sentences exist to hold: a cap is not a capacity, and an append amount is not a total.
+_FORMAT_BASIS: dict[str, str] = {
+    SIZE_NO_BOUND: (
+        "this formatter takes no length parameter, so no upper limit on the write exists in the "
+        "call; how much is written depends on the values formatted, which is not decided here"
+    ),
+    SIZE_CAP_CONST: (
+        "the write is capped at a literal constant; whether the destination is that large is not "
+        "known here, so this bounds the write and not the overflow"
+    ),
+    SIZE_CAP_VARIABLE: (
+        "the write is capped at a variable; both the cap's value and the destination's capacity "
+        "are outside what this read establishes"
+    ),
+    SIZE_APPEND_CONST: (
+        "a literal constant number of bytes is APPENDED; the total written is that plus whatever "
+        "the destination already holds, which is not known here"
+    ),
+    SIZE_APPEND_VARIABLE: (
+        "a variable number of bytes is APPENDED; neither that amount nor the destination's "
+        "existing contents are established here"
+    ),
+}
+
+
 def grade_candidate(
     pseudocode: str,
     callees: list[str],
@@ -158,6 +191,23 @@ def grade_candidate(
         cs = classify_copy_size(pseudocode, sink_name, occurrence=copy_occurrence)
         basis = _COPY_BASIS.get(cs.kind, _BASIS_ORIGIN_UNKNOWN)
         return ReachabilityVerdict("unknown", copy_size_form_note(cs.kind), basis)
+
+    if sink_name in FORMAT:
+        # A buffer formatter writes into a destination, so it is graded on the WRITE LENGTH — the
+        # same axis as a copy, and for the same reason never "confirmed" from inside one function.
+        #
+        # It must not fall through to the general branch below. That one reads argument 0 as a
+        # command string and runs the seed/validator flow over it; for a formatter argument 0 is
+        # the DESTINATION POINTER, so a covered-looking pointer would produce a reachability
+        # verdict about the wrong value entirely. Whatever a formatter's write length turns out to
+        # be, the verdict here is 'unknown': the facts are about the call, and none of them
+        # establishes that a write is or is not reachable.
+        fs = classify_format_size(pseudocode, sink_name, occurrence=copy_occurrence)
+        basis = _FORMAT_BASIS.get(fs.kind, _BASIS_ORIGIN_UNKNOWN)
+        # copy_size_form_note holds none of the five formatter kinds, so this is structurally None
+        # — a formatter is never demoted on its length. Called rather than hardcoded so the two
+        # cannot disagree if a kind is ever added.
+        return ReachabilityVerdict("unknown", copy_size_form_note(fs.kind), basis)
 
     # Format-string sinks are graded on the FORMAT argument (the danger axis), per-sink position;
     # a literal format yields no identifier (safe). Every other sink is graded on arg0 (command

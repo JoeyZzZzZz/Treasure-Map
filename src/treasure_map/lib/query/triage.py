@@ -1168,6 +1168,7 @@ def source_origin(
 # above — those hold sink NAMES (system, vfprintf); these are the class strings stored on the
 # pattern row, and confusing the two silently matches nothing.
 _CLASS_COPY = "copy"
+_CLASS_FORMAT = "format"
 _CLASS_FMT = "fmt_string"
 _CLASS_CMD = "cmd"
 _CLASS_PATH = "path_sink"
@@ -1203,6 +1204,47 @@ _SIZE_KIND_READING: dict[str, str] = {
         "that it restricts anything"
     ),
     "untraced": "the length was not traced at all — this is the absence of a fact, not a small one",
+    # The buffer-formatter kinds. Each states what the CALL provides and stops there: none of them
+    # knows how big the destination is, so none of them can say whether the write fits.
+    "no_bound": (
+        "this formatter takes no length parameter — there is no upper limit on the write in the "
+        "call itself. What actually gets written depends on the values formatted in"
+    ),
+    "cap_const": (
+        "the write is capped at a literal constant. That bounds the WRITE, not the overflow: "
+        "whether the destination is at least that large is not known here"
+    ),
+    "cap_variable": (
+        "the write is capped at a variable — trace that variable, and note that even a known cap "
+        "says nothing about the destination's capacity"
+    ),
+    "append_const": (
+        "a literal constant number of bytes is APPENDED. The total written is that plus whatever "
+        "the destination already holds, which is not known here"
+    ),
+    "append_variable": (
+        "a variable number of bytes is APPENDED, on top of the destination's existing contents — "
+        "neither amount is established here"
+    ),
+}
+
+# How much of a buffer formatter's FORMAT STRING could be read, in the reader's words. A separate
+# axis from the length: it never changes what the length is, only how much is known about what
+# expands into the buffer.
+_FORMAT_STRING_READING: dict[str, str] = {
+    "literal_with_args": (
+        "the format string is a literal with expansions — the values that get formatted in are "
+        "readable in the call"
+    ),
+    "literal_constant": (
+        "the format string is a literal with nothing to expand; what the call writes comes from "
+        "the format itself"
+    ),
+    "unresolved": (
+        "the format string could not be read here — a variable format, or a callee that has none "
+        "(strcat/strncat). That is a gap in what is known, and says nothing either way about what "
+        "the call writes"
+    ),
 }
 
 
@@ -1235,6 +1277,16 @@ def _copy_surface(evidence: dict[str, Any]) -> dict[str, Any] | None:
     callsite = evidence.get("copy_callsite")
     if callsite is not None:
         out["callsite"] = callsite
+    # Buffer formatters carry one field a copy has no equivalent for. Present only when the
+    # producer wrote it, so a copy candidate never grows an empty format slot.
+    fmt_state = evidence.get("format_string")
+    if fmt_state is not None:
+        out["format_string"] = {
+            "state": fmt_state,
+            "reading": _FORMAT_STRING_READING.get(
+                str(fmt_state), "a format-string state this reader does not know how to describe"
+            ),
+        }
     if out["clamp_seen"] or kind in ("clamp", "pointer_guard"):
         out["not_asserted"] = _SURFACE_NOT_BOUNDED
     if boundary and boundary != "reached_sink":
@@ -1303,10 +1355,11 @@ def evidence_surface(
 ) -> dict[str, Any] | None:
     """The already-computed length / format / exec-shape facts for one candidate, or None.
 
-    Dispatched on the candidate's sink class, because the three analyses are disjoint: a copy
-    candidate has a length picture and no format position, a command candidate has neither. None
-    when this candidate's class has no such analysis, or when the analysis recorded nothing —
-    absent rather than empty, so "no picture" can never read as "the picture is clear".
+    Dispatched on the candidate's sink class, because the analyses are disjoint: a copy or a
+    buffer formatter has a length picture, a printf-family sink has a format position, a command
+    candidate has neither. None when this candidate's class has no such analysis, or when the
+    analysis recorded nothing — absent rather than empty, so "no picture" can never read as "the
+    picture is clear".
 
     Derived and read-only. It states what shape was found and what was not decided; it decides
     nothing, and it is not an input to any reading of controllability."""
@@ -1318,7 +1371,9 @@ def evidence_surface(
             parsed = None
         if isinstance(parsed, dict):
             evidence = parsed
-    if sink_class == _CLASS_COPY:
+    if sink_class in (_CLASS_COPY, _CLASS_FORMAT):
+        # One reader for both: a buffer formatter is read on the same write-length axis a copy is,
+        # and its record has the same shape plus a format-string field the copy path never writes.
         return _copy_surface(evidence)
     if sink_class == _CLASS_FMT:
         return _fmt_surface(evidence)

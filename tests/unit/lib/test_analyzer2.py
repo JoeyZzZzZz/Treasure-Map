@@ -265,8 +265,12 @@ def test_writer_scans_component_table_binary(tmp_path: Path) -> None:
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer2(db, atlas, source_run_id="run_dcs")
 
-    assert stats.matches == 2
-    assert stats.instances_written == 2
+    # Per class rather than a bare total: each function's snprintf is a command candidate AND a
+    # buffer-formatter write candidate, so "how many matches" is no longer "how many cmd shapes".
+    # What this test is about — every binary was scanned, including the components-table one — is
+    # the cmd count.
+    assert _class_counts(atlas) == {"cmd": 2, "format": 2}
+    assert stats.matches == stats.instances_written == 4
     conn = open_atlas(atlas)
     try:
         paths = {r[0] for r in conn.execute("SELECT binary_path FROM instance")}
@@ -1458,6 +1462,7 @@ def test_evidence_ref_distinguishes_same_named_binaries(tmp_path: Path) -> None:
         refs = [r["evidence_ref"] for r in conn.execute("SELECT evidence_ref FROM instance")]
     finally:
         conn.close()
+    refs = [r for r in refs if r.endswith("@cmd")]  # this is about the cmd axis of each binary
     assert len(refs) == 2
     assert len(set(refs)) == 2, f"same-named binaries collided at the same address: {refs}"
 
@@ -1470,7 +1475,7 @@ def test_raw_evidence_is_not_persisted(tmp_path: Path) -> None:
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_dcs")
 
-    (row,) = _instances(atlas)
+    (row,) = _instances_of(atlas, "cmd")
     # evidence_ref holds a neutral per-instance locator (run-scoped function id), not the
     # raw firmware literal.
     assert row["evidence_ref"] != RAW_EVIDENCE
@@ -1489,14 +1494,22 @@ def test_evidence_ref_unique_per_instance(tmp_path: Path) -> None:
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_x")
 
-    rows = _instances(atlas)
+    rows = _instances_of(atlas, "cmd")
     assert len(rows) == 2
     refs = [r["evidence_ref"] for r in rows]
     assert len(set(refs)) == 2, f"evidence_ref collided across instances: {refs}"
+    # ...and across every axis at once, which is the property that actually has to hold.
+    all_refs = [r["evidence_ref"] for r in _instances(atlas)]
+    assert len(set(all_refs)) == len(all_refs)
     # One shared pattern fingerprint underneath; the per-instance refs are never that value.
     conn = open_atlas(atlas)
     try:
-        fps = {r[0] for r in conn.execute("SELECT structural_fingerprint FROM pattern")}
+        fps = {
+            r[0]
+            for r in conn.execute(
+                "SELECT structural_fingerprint FROM pattern WHERE sink_class = 'cmd'"
+            )
+        }
     finally:
         conn.close()
     assert len(fps) == 1  # same shape -> one pattern
@@ -1516,7 +1529,7 @@ def test_instance_carries_binary_location(tmp_path: Path) -> None:
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_loc")
 
-    (row,) = _instances(atlas)
+    (row,) = _instances_of(atlas, "cmd")
     assert row["binary_path"] == "usr/sbin/webd"  # full path, not the bare name
     assert row["binary_content_hash"] == _sha("webd")  # the source binary's sha256
 
@@ -1527,7 +1540,7 @@ def test_binary_path_falls_back_to_name_when_source_has_no_path(tmp_path: Path) 
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_np")
 
-    (row,) = _instances(atlas)
+    (row,) = _instances_of(atlas, "cmd")
     assert row["binary_path"] == "webd"
 
 
@@ -1549,6 +1562,7 @@ def test_location_survives_source_db_removal(tmp_path: Path) -> None:
         cands = triage(conn, run_id="run_gone")
     finally:
         conn.close()
+    cands = [c for c in cands if c.sink_class == "cmd"]
     assert len(cands) == 1
     assert cands[0].binary_path == "usr/sbin/webd"  # served from the atlas alone
 
@@ -1561,8 +1575,8 @@ def test_parameter_sourced_match_is_unknown_l0(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer2(db, atlas, source_run_id="r")
-    assert stats.by_status["unknown"] == 1
-    (row,) = _instances(atlas)
+    assert stats.by_status["unknown"] == 2  # the cmd candidate and the snprintf write candidate
+    (row,) = _instances_of(atlas, "cmd")
     assert row["reachability_status"] == "unknown"
     assert row["provenance_level"] == "L0"
 
@@ -1576,7 +1590,7 @@ def test_second_run_appends_and_recomputes_breadth(tmp_path: Path) -> None:
     run_analyzer2(db, atlas, source_run_id="run_1")
     run_analyzer2(db, atlas, source_run_id="run_2")
 
-    assert len(_instances(atlas)) == 2
+    assert len(_instances_of(atlas, "cmd")) == 2  # one per run, on the axis this is about
     conn = open_atlas(atlas)
     try:
         breadth = conn.execute("SELECT MAX(device_spread) FROM pattern").fetchone()[0]
@@ -1741,8 +1755,58 @@ def _numeric_fn(name: str = "run_num") -> dict[str, object]:
     }
 
 
-def _by_anchor(atlas_path: Path) -> dict[str, sqlite3.Row]:
-    return {r["source_anchor"]: r for r in _instances(atlas_path)}
+def _instances_of(atlas_path: Path, sink_class: str) -> list[sqlite3.Row]:
+    """This run's instances on ONE sink axis.
+
+    A fixture built for the command axis also produces buffer-formatter write candidates — its
+    snprintf is a formatter writing into a buffer, which is now read on the write-length axis. A
+    test about command candidates therefore has to say so; counting every instance would make it
+    a test about how many axes happen to fire."""
+    conn = open_atlas(atlas_path)
+    try:
+        return conn.execute(
+            "SELECT i.* FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
+            "WHERE p.sink_class = ? ORDER BY i.instance_id",
+            (sink_class,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _class_counts(atlas_path: Path) -> dict[str, int]:
+    """How many instances each sink class produced — the honest replacement for a bare total."""
+    conn = open_atlas(atlas_path)
+    try:
+        return {
+            r[0]: r[1]
+            for r in conn.execute(
+                "SELECT p.sink_class, COUNT(*) FROM instance i "
+                "JOIN pattern p ON p.pattern_id = i.pattern_id GROUP BY p.sink_class"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+
+def _by_anchor(atlas_path: Path, sink_class: str = "cmd") -> dict[str, sqlite3.Row]:
+    """One function's instance ON ONE AXIS, keyed by source_anchor.
+
+    The sink class is a parameter and not an afterthought: one function now yields several
+    instances — a snprintf that builds a shell string is both a command candidate and a
+    buffer-formatter write candidate, under different refs. Keyed by anchor alone, whichever row
+    came last would win, and a test checking a cmd-axis form note would silently read the
+    formatter's row and see None. 'cmd' is the default because that is the axis most of these
+    tests are about; a test on another axis says so."""
+    conn = open_atlas(atlas_path)
+    try:
+        rows = conn.execute(
+            "SELECT i.* FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
+            "WHERE p.sink_class = ? ORDER BY i.instance_id",
+            (sink_class,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {r["source_anchor"]: r for r in rows}
 
 
 def _cand_of(atlas_path: Path, fn: str):  # type: ignore[no-untyped-def]
@@ -2154,8 +2218,8 @@ def _add_script_call(
         conn.close()
 
 
-def _evidence_of(atlas_path: Path, fn: str) -> dict:
-    row = _by_anchor(atlas_path)[fn]
+def _evidence_of(atlas_path: Path, fn: str, sink_class: str = "cmd") -> dict:
+    row = _by_anchor(atlas_path, sink_class)[fn]
     return json.loads(row["flow_evidence"])
 
 
@@ -2189,7 +2253,7 @@ def test_copy_size_bands_const_drops_variable_and_cmd_stay_high(tmp_path: Path) 
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_band")
 
-    rows = _by_anchor(atlas)
+    rows = _by_anchor(atlas, "copy")
     # Copy sinks never confirm; the constant length is downweighted, the unproven lengths are not.
     assert rows["cc"]["reachability_status"] == "unknown"
     assert rows["cc"]["blocking_mechanism"] == "const_size"
@@ -2235,7 +2299,7 @@ def test_fmtstr_cve_recalled_and_literal_not_flooded(tmp_path: Path) -> None:
     )
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_fmt")
-    rows = _by_anchor(atlas)
+    rows = _by_anchor(atlas, "fmt_string")
     # (1) recalled, as an fmt_string candidate anchored to syslog, with format evidence.
     assert "risky_log" in rows
     ev = json.loads(rows["risky_log"]["flow_evidence"])
@@ -2291,7 +2355,7 @@ def test_copy_candidate_has_size_evidence(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "webd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_cp")
-    ev = json.loads(_by_anchor(atlas)["cp_fn"]["flow_evidence"])
+    ev = json.loads(_by_anchor(atlas, "copy")["cp_fn"]["flow_evidence"])
     assert ev["size_kind"] == "source_len"
     assert "size_flow" in ev and "clamp_seen" in ev and "trace_boundary" in ev
 
@@ -2336,7 +2400,11 @@ def test_flow_evidence_does_not_add_candidates(tmp_path: Path) -> None:
     _add_script_call(db, "/etc/init.d/netd.sh", "netd", 5, "literal")
     atlas = tmp_path / "atlas.db"
     s1 = run_analyzer2(db, atlas, source_run_id="run_n1")
-    assert s1.instances_written == len(_instances(atlas)) == s1.matches == 1
+    # On the cmd axis, where the evidence is attached. The fixture's snprintf is separately a
+    # buffer-formatter write candidate, which is a different shape being detected — not evidence
+    # manufacturing a candidate, which is what this test guards.
+    assert len(_instances_of(atlas, "cmd")) == 1
+    assert s1.instances_written == len(_instances(atlas)) == s1.matches
 
 
 # ── factor ① one-hop wrapper propagation (R-L3·A): recover the D-2 blind spot ─────────
@@ -2572,7 +2640,7 @@ def test_free_string_via_fmt_wrapper_becomes_fmt_candidate(tmp_path: Path) -> No
     stats = run_analyzer2(db, atlas, source_run_id="run_fmt")
     assert stats.wrapper_propagated == 1
 
-    row = _by_anchor(atlas)["handle_req"]
+    row = _by_anchor(atlas, "fmt_string")["handle_req"]
     assert row["sink_anchor"] == "printf"  # the real format-string sink, reached via the wrapper
     assert row["provenance_level"] == "L0"  # cross-function: not graded, honest
     assert row["blocking_mechanism"] is None  # free string -> not downweighted
@@ -2587,13 +2655,18 @@ def test_free_string_via_fmt_wrapper_becomes_fmt_candidate(tmp_path: Path) -> No
     # The candidate is on the fmt_string axis (its pattern), never mislabeled as cmd.
     conn = open_atlas(atlas)
     try:
-        sink_class = conn.execute(
-            "SELECT p.sink_class FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
-            "WHERE i.source_anchor = 'handle_req'"
-        ).fetchone()[0]
+        classes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT p.sink_class FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
+                "WHERE i.source_anchor = 'handle_req'"
+            ).fetchall()
+        }
     finally:
         conn.close()
-    assert sink_class == "fmt_string"
+    # Never mislabeled as cmd. 'format' rides alongside because the same function snprintf's into
+    # a buffer, which is a genuine second shape at a different ref — not this candidate's class.
+    assert "fmt_string" in classes and "cmd" not in classes
 
 
 def _unknown_via_fmt_wrapper_fn(name: str = "log_status") -> dict[str, object]:
@@ -2620,7 +2693,7 @@ def test_fmt_wrapper_unknown_source_is_demoted_and_counted_not_dropped(tmp_path:
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer2(db, atlas, source_run_id="run_fmt_unk")
     assert stats.fmt_wrapper_unknown_source_demoted == 1  # counted as demoted
-    assert "emit_state" in _by_anchor(atlas)  # SURVIVES — the corpus did not shrink
+    assert "emit_state" in _by_anchor(atlas, "fmt_string")  # SURVIVES — corpus did not shrink
 
 
 def test_fmt_wrapper_itself_kept_as_distinct_candidate(tmp_path: Path) -> None:
@@ -2632,7 +2705,7 @@ def test_fmt_wrapper_itself_kept_as_distinct_candidate(tmp_path: Path) -> None:
     )
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="run_fmt2")
-    rows = _by_anchor(atlas)
+    rows = _by_anchor(atlas, "fmt_string")
     assert rows["log_msg"]["evidence_ref"].endswith("@fmt_string")
     assert rows["handle_req"]["evidence_ref"].endswith("@fmt_via_wrapper")
     refs = [r["evidence_ref"] for r in _instances(atlas)]
@@ -2663,7 +2736,7 @@ def test_unknown_source_fmt_wrapper_candidate_survives_in_corpus(tmp_path: Path)
     atlas = tmp_path / "atlas.db"
     stats = run_analyzer2(db, atlas, source_run_id="run_fmt_drop")
     assert stats.wrapper_propagated == 1  # recovered, not discarded
-    anchors = set(_by_anchor(atlas))
+    anchors = set(_by_anchor(atlas, "fmt_string"))
     assert "emit_state" in anchors  # queryable: it has its own @fmt_via_wrapper instance
     assert "log_msg" in anchors  # the wrapper stays its own direct fmt candidate (printf param)
 
@@ -2689,7 +2762,7 @@ def test_fmt_wrapper_keeps_controllable_and_demotes_unknown(tmp_path: Path) -> N
     stats = run_analyzer2(db, atlas, source_run_id="run_fmt_gate")
     assert stats.wrapper_propagated == 2  # BOTH recovered; the difference is rank, not presence
     assert stats.fmt_wrapper_unknown_source_demoted == 1
-    anchors = set(_by_anchor(atlas))
+    anchors = set(_by_anchor(atlas, "fmt_string"))
     assert "handle_req" in anchors  # external_input -> kept, ranks high
     assert "emit_state" in anchors  # unknown -> kept, ranks low (never removed)
     # the ladder, not the gate, separates them: free outranks unknown, and neither is sunk
@@ -2780,7 +2853,7 @@ def test_path_sink_reads_per_sink_arg_position(tmp_path: Path) -> None:
     db = _make_db(tmp_path, [{"name": "svcd", "funcs": [fn]}])
     atlas = tmp_path / "atlas.db"
     run_analyzer2(db, atlas, source_run_id="r")
-    assert _by_anchor(atlas)["oa"]["blocking_mechanism"] == "const_sink_arg"
+    assert _by_anchor(atlas, "path_sink")["oa"]["blocking_mechanism"] == "const_sink_arg"
     assert _ctrl_of(atlas, "oa") == "constant" and _is_safe(atlas, "oa")
 
 
@@ -3024,7 +3097,7 @@ def _fmt_atlas(tmp_path: Path, funcs: list[dict[str, object]], *, run: str = "ru
 
 def _fmt_records(atlas: Path, fn: str) -> list[dict[str, object]]:
     """The sink_arg_provenance records stored for ``fn``'s wrapper-recovered instance."""
-    row = _by_anchor(atlas)[fn]
+    row = _by_anchor(atlas, "fmt_string")[fn]
     return json.loads(row["flow_evidence"] or "{}").get("sink_arg_provenance", [])
 
 
@@ -3297,7 +3370,7 @@ def test_fmt_tagfirst_const_traced_not_arg0marker(tmp_path: Path) -> None:
     assert rec["provenance"]["value"] == "user=%s password=%s"
     assert rec["arg_idx"] == 1
     # d. the format axis stores no note at all
-    assert _by_anchor(atlas)["auth_log"]["blocking_mechanism"] is None
+    assert _by_anchor(atlas, "fmt_string")["auth_log"]["blocking_mechanism"] is None
 
 
 def test_cmd_axis_keeps_its_form_note(tmp_path: Path) -> None:
@@ -3543,3 +3616,226 @@ def test_per_callsite_copies_do_not_move_the_recurrence_ledgers(tmp_path: Path) 
     assert len(ledger) == 1  # one shape, one pattern row
     assert [(r["device_spread"], r["pattern_breadth"]) for r in ledger] == [(1, 1)]
     assert [r["instance_count"] for r in density] == [3]  # the candidate count is what grew
+
+
+# ── a buffer formatter's write, end to end ───────────────────────────────────────────
+
+
+def _formatter_fn(name: str = "build_reply") -> dict[str, object]:
+    """One function writing into buffers three ways: capped, uncapped, and appending.
+
+    The mix is the point — the length argument sits at a DIFFERENT position for each, so a
+    candidate handed the wrong callee's name reads the wrong argument entirely."""
+    return {
+        "name": name,
+        "address": "0x408100",
+        "hash": f"h_{name}",
+        "callees": ["recv", "snprintf", "sprintf", "strncat"],
+        "pseudocode": (
+            f"void {name}(char *param_1) {{\n"
+            "  char acStack_100[64];\n"
+            "  recv(fd, param_1, 256);\n"
+            '  snprintf(acStack_100, 64, "id=%s", param_1);\n'
+            '  sprintf(param_1, "reply %s", acStack_100);\n'
+            "  strncat(acStack_100, param_1, 8);\n"
+            "}"
+        ),
+    }
+
+
+def _format_rows(atlas_path: Path, anchor: str) -> list[sqlite3.Row]:
+    conn = open_atlas(atlas_path)
+    try:
+        return conn.execute(
+            "SELECT i.* FROM instance i JOIN pattern p ON p.pattern_id = i.pattern_id "
+            "WHERE p.sink_class = 'format' AND i.source_anchor = ? ORDER BY i.evidence_ref",
+            (anchor,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_each_formatter_write_is_its_own_candidate_carrying_its_own_length(
+    tmp_path: Path,
+) -> None:
+    """★ THE property. Three formatter writes, three candidates, each with ITS call's length fact.
+
+    Before this the whole family produced nothing: a formatter that overruns its destination was
+    not a low-ranked lead, it had no row. And the per-call part is not cosmetic — the length
+    argument is at a different position for each of these three callees, so a candidate reading the
+    function's "first" formatter would report a cap for a call that has none.
+
+    MUTATION (must go RED): re-derive the sink name per FUNCTION instead of per callsite (drop
+    "format" from the evidence-anchored tuple); every candidate then reads one callee's position."""
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_formatter_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_f")
+
+    rows = _format_rows(atlas, "build_reply")
+    assert [r.rsplit("@", 1)[1] for r in [str(x["evidence_ref"]) for x in rows]] == [
+        "format#0",
+        "format#1",
+        "format#2",
+    ]
+    assert [r["sink_anchor"] for r in rows] == ["snprintf", "sprintf", "strncat"]
+    kinds = [json.loads(str(r["flow_evidence"]))["size_kind"] for r in rows]
+    assert kinds == ["cap_const", "no_bound", "append_const"]
+    sizes = [json.loads(str(r["flow_evidence"]))["size_flow"]["size_arg"] for r in rows]
+    assert sizes == ["64", None, "8"]  # the cap, nothing, the append amount
+
+
+def test_a_formatter_is_never_confirmed_and_never_demoted_on_its_length(
+    tmp_path: Path,
+) -> None:
+    """MC-a2 with teeth, end to end: these are leads, and none of their lengths sinks them.
+
+    Two separate things have to hold. The grade is always ``unknown`` — a formatter is graded on
+    the WRITE, and nothing about a write length establishes that anything reaches it; falling
+    through to the general branch would read argument 0, which for a formatter is the DESTINATION
+    POINTER, and could produce a reachability verdict about the wrong value. And no length carries
+    a form note, so the demotion that sinks a proven-constant candidate out of the first screen
+    never fires here — including for the capped one, which is the tempting case: a literal cap
+    looks like a literal length, and a literal length does demote a copy.
+
+    The fixture is built so the two answers DIFFER. Its destination is a buffer ``recv`` filled, so
+    argument 0 carries an uncovered network seed, and through the general branch that shape grades
+    ``confirmed`` — verified directly: the identical body with ``system(acStack_100)`` comes back
+    confirmed. A formatter reported confirmed would be a claim about the pointer being written
+    into. A fixture whose two answers happened to agree would be no test at all, which is what the
+    first version of this one was.
+
+    MUTATION (must go RED): route FORMAT through the general grader branch, or give any formatter
+    kind a form note."""
+    reached = _formatter_fn("build_reply")
+    reached["pseudocode"] = (
+        "void build_reply(void) {\n"
+        "  char acStack_100[64];\n"
+        "  recv(fd, acStack_100, 64);\n"
+        '  snprintf(acStack_100, 64, "id=%s", acStack_100);\n'
+        '  sprintf(acStack_100, "reply %s", acStack_100);\n'
+        "  strncat(acStack_100, acStack_100, 8);\n"
+        "}"
+    )
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [reached]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_f")
+
+    rows = _format_rows(atlas, "build_reply")
+    assert len(rows) == 3
+    assert {r["reachability_status"] for r in rows} == {"unknown"}
+    assert {r["blocking_mechanism"] for r in rows} == {None}
+
+    from treasure_map.lib.query import triage as run_triage
+    from treasure_map.lib.query.triage import _is_proven_safe
+
+    conn = open_atlas(atlas)
+    try:
+        by_ref = {c.evidence_ref: c for c in run_triage(conn)}
+    finally:
+        conn.close()
+    for row in rows:
+        cand = by_ref[str(row["evidence_ref"])]
+        assert cand.dim("controllability").state == "unknown"
+        assert not _is_proven_safe(cand), row["sink_anchor"]
+
+
+def test_a_formatter_candidate_says_how_much_of_its_format_could_be_read(
+    tmp_path: Path,
+) -> None:
+    """The second axis, kept separate from the length on purpose.
+
+    How readable the format string is never changes what the length IS — that comes from the
+    callee's signature. Folding them would let ``snprintf(dst, 64, fmt_var, ...)`` come back
+    claiming no cap exists, and would let a constant format claim the same. Recorded alongside so
+    an agent can see both without either overwriting the other.
+
+    MUTATION (must go RED): derive size_kind from the format string, or drop the format_string
+    field."""
+    fn = _formatter_fn()
+    fn["pseudocode"] = (
+        "void build_reply(char *param_1, char *fmt) {\n"
+        "  char acStack_100[64];\n"
+        '  snprintf(acStack_100, 64, "id=%s", param_1);\n'
+        '  snprintf(acStack_100, 64, "fixed text");\n'
+        "  snprintf(acStack_100, 64, fmt, param_1);\n"
+        "  strcat(acStack_100, param_1);\n"
+        "}"
+    )
+    fn["callees"] = ["snprintf", "strcat"]
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [fn]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_f")
+
+    ev = [json.loads(str(r["flow_evidence"])) for r in _format_rows(atlas, "build_reply")]
+    assert [e["format_string"] for e in ev] == [
+        "literal_with_args",
+        "literal_constant",
+        "unresolved",
+        "unresolved",  # strcat has no format string at all
+    ]
+    # ...and every one of them still reports the cap its signature carries.
+    assert [e["size_kind"] for e in ev] == ["cap_const", "cap_const", "cap_const", "no_bound"]
+
+
+def test_the_command_axis_form_notes_do_not_run_on_a_formatter(tmp_path: Path) -> None:
+    """A formatter's argument 0 is the destination POINTER, not a command string.
+
+    ``detect_form_signal`` reads argument 0 as the dangerous value and can attach a note that
+    demotes. Pointed at a formatter it would be reading the buffer being written INTO, and any
+    note that came back would demote on a reading of the wrong value entirely. The fixture uses a
+    string literal destination name so the const-argument note is what would fire.
+
+    The fixture makes that note actually fire: a charset-safe converter's result is formatted INTO
+    the destination, which is enough for the cmd-axis charset check to mark argument 0 — the
+    destination — as constrained and hand back a demoting note. Verified directly before writing it
+    down; a fixture where no note fires either way would pass on both sides of the mutation.
+
+    MUTATION (must go RED): drop "format" from the exclusion tuple."""
+    fn = _formatter_fn()
+    fn["pseudocode"] = (
+        "void build_reply(void) { char acStack_32[32]; "
+        'sprintf(acStack_32, "%s", inet_ntoa(uVar1)); }'
+    )
+    fn["callees"] = ["sprintf", "inet_ntoa"]
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [fn]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_f")
+
+    rows = _format_rows(atlas, "build_reply")
+    assert len(rows) == 1
+    assert rows[0]["blocking_mechanism"] is None
+
+
+def test_a_formatter_length_picture_reaches_the_reader(tmp_path: Path) -> None:
+    """The facts have to arrive somewhere an agent looks, not just in a stored column.
+
+    The length reader is shared with the copy axis — a formatter is read on the same axis — plus
+    the format-string field the copy path never writes.
+
+    MUTATION (must go RED): stop dispatching 'format' to the length surface."""
+    db = _make_db(tmp_path, [{"name": "httpd", "funcs": [_formatter_fn()]}])
+    atlas = tmp_path / "atlas.db"
+    run_analyzer2(db, atlas, source_run_id="run_f")
+
+    conn = open_atlas(atlas)
+    try:
+        surfaces = [
+            explain_candidate(conn, str(r["evidence_ref"])).evidence_surface  # type: ignore[union-attr]
+            for r in _format_rows(atlas, "build_reply")
+        ]
+    finally:
+        conn.close()
+    assert [s["size_kind"] for s in surfaces] == [  # type: ignore[index]
+        "cap_const",
+        "no_bound",
+        "append_const",
+    ]
+    for s in surfaces:
+        assert s is not None
+        assert s["reading"]  # a sentence, not the "reader does not know this kind" fallback
+        assert "does not know how to describe" not in s["reading"]
+        assert s["format_string"]["state"] in (
+            "literal_with_args",
+            "literal_constant",
+            "unresolved",
+        )

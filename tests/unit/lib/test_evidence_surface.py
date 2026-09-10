@@ -394,3 +394,57 @@ def test_the_blanket_note_now_names_the_bare_form_note() -> None:
     assert "no_shell_exec" not in _DERIVED_SIGNAL_NOTE
     assert "no_shell_exec" in _BARE_FORM_NOTE_CAVEAT
     assert "NOT that it cannot be injected" in _BARE_FORM_NOTE_CAVEAT
+
+
+def test_the_write_length_kinds_partition_into_demotable_and_not() -> None:
+    """MC-a4. Every write-length kind is written out here, on the side it belongs to.
+
+    The two halves are different claims, and only one of them may cost a candidate its place:
+
+    * demotable — the length PROVES the write is bounded. That is what earns the demotion.
+    * not demotable — everything else, including all five buffer-formatter kinds. A cap bounds the
+      write and leaves the destination's capacity unknown; an append amount is not a total; and
+      "this signature has no length parameter" is the absence of a limit, not a bounded write.
+
+    Stated as set EQUALITY against the module's own tables, not as a spot check, because the way
+    this breaks is a kind being added and quietly landing on the demotable side — where it would
+    sink every candidate carrying it, on the strength of a number that does not answer the
+    question. A new kind arrives here as a red test, before it arrives on a real firmware.
+
+    MUTATION (must go RED): add a formatter kind to _FORM_NOTE, or add a kind to the module and
+    not to this list."""
+    from treasure_map.lib.reachability import copy_size as cs
+
+    demotable = {cs.SIZE_CONST, cs.SIZE_SIZEOF, cs.SIZE_CLAMP, cs.SIZE_POINTER_GUARD}
+    copy_not_demotable = {cs.SIZE_VARIABLE, cs.SIZE_SOURCE_LEN, cs.SIZE_UNTRACED}
+    format_not_demotable = {
+        cs.SIZE_CAP_CONST,
+        cs.SIZE_CAP_VARIABLE,
+        cs.SIZE_APPEND_CONST,
+        cs.SIZE_APPEND_VARIABLE,
+        cs.SIZE_NO_BOUND,
+    }
+
+    assert set(cs._FORM_NOTE) == demotable
+    assert not (format_not_demotable & set(cs._FORM_NOTE))
+    assert not (copy_not_demotable & set(cs._FORM_NOTE))
+
+    # ...and the three sets are the WHOLE universe of SIZE_* kinds the module defines, so a kind
+    # cannot be added without landing in one of them.
+    declared = {v for k, v in vars(cs).items() if k.startswith("SIZE_") and isinstance(v, str)}
+    assert declared == demotable | copy_not_demotable | format_not_demotable
+
+
+def test_every_write_length_kind_has_a_reading() -> None:
+    """A kind the reader cannot describe reaches the agent as a shrug in place of a fact.
+
+    ``_copy_surface`` falls back to "not one this reader knows how to describe", which is honest
+    and useless. Adding a length kind without adding its sentence would ship exactly that for
+    every candidate carrying it.
+
+    MUTATION (must go RED): add a SIZE_* kind and no entry in _SIZE_KIND_READING."""
+    from treasure_map.lib.query.triage import _SIZE_KIND_READING
+    from treasure_map.lib.reachability import copy_size as cs
+
+    declared = {v for k, v in vars(cs).items() if k.startswith("SIZE_") and isinstance(v, str)}
+    assert declared <= set(_SIZE_KIND_READING), declared - set(_SIZE_KIND_READING)

@@ -36,7 +36,14 @@ DEFAULT_SINK_IMPACT: dict[str, int] = {
     # classified), not a magnitude-of-harm claim.
     "path_sink": IMPACT_HIGH,
     "copy": IMPACT_MEDIUM,  # memcpy / strcpy / strncpy — buffer overflow
-    "format": IMPACT_LOW,  # plain string formatting into a buffer
+    # sprintf / snprintf / strcat / … — a formatter writing into a destination buffer. Left at LOW,
+    # and that placement is now load-bearing in a way it was not: until the write-length axis was
+    # extended to this family the class produced no candidates at all, so the tier ordered nothing.
+    # It now orders real memory-write leads BELOW every copy one. That is an overridable judgement
+    # like the rest of this map (--impact-order), not a claim that a formatter overrun matters less
+    # than a memcpy overrun; it is left where it was because moving it is a ranking decision, and
+    # this map is where such a decision is made deliberately rather than as a side effect.
+    "format": IMPACT_LOW,
     "log": IMPACT_LOW,  # syslog and similar — lowest
 }
 

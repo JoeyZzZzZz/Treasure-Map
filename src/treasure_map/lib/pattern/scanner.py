@@ -82,6 +82,7 @@ def scan(db_path: Path | str) -> ScanResult:
         "bare_cmd_shape": 0,
         "fmt_string_shape": 0,
         "path_sink_shape": 0,
+        "format_overflow_shape": 0,
     }
 
     for row in rows:
@@ -118,6 +119,7 @@ def scan(db_path: Path | str) -> ScanResult:
         bare_cmd=hits["bare_cmd_shape"],
         fmt_string=hits["fmt_string_shape"],
         path_sink=hits["path_sink_shape"],
+        format_overflow=hits["format_overflow_shape"],
     )
     # ★ Checked here, at runtime, on every scan. The two counts partition what the pre-filter
     # admitted, so a mismatch means a function left the loop through neither branch — a skip
